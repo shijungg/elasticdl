@@ -34,9 +34,9 @@ def load_model_from_module(model_def, model_module, model_params):
 def get_dict_from_params_str(params_str):
     """Get the dictionary of kv pairs in a string separated
     by semi-colon."""
+    params_dict = {}
     if params_str:
         kvs = params_str.split(";")
-        params_dict = {}
         for kv in kvs:
             splitted = kv.strip().split("=")
             k = splitted[0]
@@ -46,9 +46,7 @@ def get_dict_from_params_str(params_str):
                 params_dict[k] = eval(v)
             except Exception:
                 params_dict[k] = v
-        return params_dict
-    else:
-        return None
+    return params_dict
 
 
 def get_module_file_path(model_zoo, spec_key):
@@ -102,6 +100,7 @@ def get_model_spec(
     optimizer,
     eval_metrics_fn,
     prediction_outputs_processor,
+    custom_data_reader,
 ):
     """Get the model spec items in a tuple.
 
@@ -145,6 +144,7 @@ def get_model_spec(
             eval_metrics_fn, model_zoo, default_module, required=True
         ),
         prediction_outputs_processor,
+        _get_spec_value(custom_data_reader, model_zoo, default_module),
     )
 
 

@@ -131,7 +131,7 @@ class Parameters(object):
             embeddings_pb = model_pb.embedding_table_info
             self.init_embedding_params(embeddings_pb)
             self._restore_params_from_pb(tensors_pb)
-            self.version = model_pb.version
+            self.version = max(0, model_pb.version)
             self.init_status = True
             return True
         return False
@@ -189,11 +189,34 @@ class Parameters(object):
             )
 
         for name, embedding_table in self.embedding_params.items():
-            embedding_table_tensor = embedding_table.to_tensor()
-            tensor_pb = model_pb.param.add()
-            serialize_tensor(embedding_table_tensor, tensor_pb)
+            # Slot embedding table is not weights in the model, so we don't
+            # save it to checkpoint.
+            if not embedding_table.is_slot:
+                embedding_table_tensor = embedding_table.to_tensor()
+                tensor_pb = model_pb.param.add()
+                serialize_tensor(embedding_table_tensor, tensor_pb)
 
-            embedding_info = embedding_table.to_embedding_table_info_pb()
-            model_pb.embedding_table_info.append(embedding_info)
+                embedding_info = embedding_table.to_embedding_table_info_pb()
+                model_pb.embedding_table_info.append(embedding_info)
 
         return model_pb
+
+    def debug_info(self):
+        info = ""
+        total_size = 0
+        for param in self.embedding_params:
+            info += self.embedding_params[param].debug_info()
+            total_size += self.embedding_params[param].get_table_size()
+        for param in self.non_embedding_params:
+            shape = self.non_embedding_params[param].get_shape().as_list()
+            size = (
+                tf.size(self.non_embedding_params[param])
+                * self.non_embedding_params[param].dtype.size
+            )
+            info += (
+                "Non-embedding param name: %s\n  shape: %s\n  size: %d\n"
+                % (param, str(shape), size)
+            )
+            total_size += size
+        info += "Total parameters size: %d bytes" % total_size
+        return info

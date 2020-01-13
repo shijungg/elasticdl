@@ -10,7 +10,7 @@ import odps
 from odps import ODPS
 from odps.models import Schema
 
-from elasticdl.python.common.constants import ODPSConfig
+from elasticdl.python.common.constants import MaxComputeConfig
 from elasticdl.python.common.log_utils import default_logger as logger
 
 
@@ -51,9 +51,9 @@ def is_odps_configured():
     return all(
         k in os.environ
         for k in (
-            ODPSConfig.PROJECT_NAME,
-            ODPSConfig.ACCESS_ID,
-            ODPSConfig.ACCESS_KEY,
+            MaxComputeConfig.PROJECT_NAME,
+            MaxComputeConfig.ACCESS_ID,
+            MaxComputeConfig.ACCESS_KEY,
         )
     )
 
@@ -226,17 +226,8 @@ class ODPSReader(object):
             columns = self._odps_table.schema.names
         while retry_count < max_retries:
             try:
-                batch_record = []
-                with self._odps_table.open_reader(
-                    partition=self._partition, reopen=True
-                ) as reader:
-                    for record in reader.read(
-                        start=start, count=end - start, columns=columns
-                    ):
-                        batch_record.append(
-                            [str(record[column]) for column in columns]
-                        )
-                return batch_record
+                record_gen = self.record_generator(start, end, columns)
+                return [record for record in record_gen]
             except Exception as e:
                 if retry_count >= max_retries:
                     raise Exception("Exceeded maximum number of retries")
@@ -248,6 +239,19 @@ class ODPSReader(object):
                 )
                 time.sleep(5)
                 retry_count += 1
+
+    def record_generator(self, start, end, columns=None):
+        """Generate records from an ODPS table
+        """
+        if columns is None:
+            columns = self._odps_table.schema.names
+        with self._odps_table.open_reader(
+            partition=self._partition, reopen=False
+        ) as reader:
+            for record in reader.read(
+                start=start, count=end - start, columns=columns
+            ):
+                yield [str(record[column]) for column in columns]
 
     def get_table_size(self):
         with self._odps_table.open_reader(partition=self._partition) as reader:

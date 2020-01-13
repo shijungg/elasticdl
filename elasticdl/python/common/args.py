@@ -316,7 +316,13 @@ def add_train_params(parser):
         default="",
         help="The path to save the final trained model",
     )
-
+    parser.add_argument(
+        "--sync_version_tolerance",
+        type=int,
+        help="The maximum model version difference between reported gradients "
+        "and PS that synchronous SGD can accepts.",
+        default=0,
+    )
     add_bool_param(
         parser=parser,
         name="--use_async",
@@ -458,11 +464,25 @@ def add_common_args_between_master_and_worker(parser):
         help="The name of the optimizer defined in the model file",
     )
     parser.add_argument(
+        "--learning_rate_scheduler",
+        type=str,
+        default="learning_rate_scheduler",
+        help="Optional callable learning rate scheduler defined in"
+        "the model file, which takes model version as its input and"
+        "returns a learning rate value",
+    )
+    parser.add_argument(
         "--eval_metrics_fn",
         type=str,
         default="eval_metrics_fn",
         help="The name of the evaluation metrics function defined "
         "in the model file",
+    )
+    parser.add_argument(
+        "--custom_data_reader",
+        type=str,
+        default="custom_data_reader",
+        help="The custom data reader defined in the model file",
     )
     parser.add_argument(
         "--model_def",
@@ -496,13 +516,14 @@ def add_common_args_between_master_and_worker(parser):
         type=str,
         choices=[
             "",
+            DistributionStrategy.LOCAL,
             DistributionStrategy.PARAMETER_SERVER,
             DistributionStrategy.ALLREDUCE,
         ],
         default="",
         help="Master will use a distribution policy on a list of devices "
         "according to the distributed strategy, "
-        'e.g. "ParameterServerStrategy" or "AllreduceStrategy"',
+        'e.g. "ParameterServerStrategy" or "AllreduceStrategy" or "Local"',
     )
     parser.add_argument(
         "--checkpoint_steps",

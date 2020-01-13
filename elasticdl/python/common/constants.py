@@ -11,11 +11,11 @@ class InstanceManagerStatus(object):
     FINISHED = "Finished"
 
 
-class ODPSConfig(object):
-    PROJECT_NAME = "ODPS_PROJECT_NAME"
-    ACCESS_ID = "ODPS_ACCESS_ID"
-    ACCESS_KEY = "ODPS_ACCESS_KEY"
-    ENDPOINT = "ODPS_ENDPOINT"
+class MaxComputeConfig(object):
+    PROJECT_NAME = "MAXCOMPUTE_PROJECT"
+    ACCESS_ID = "MAXCOMPUTE_AK"
+    ACCESS_KEY = "MAXCOMPUTE_SK"
+    ENDPOINT = "MAXCOMPUTE_ENDPOINT"
 
 
 class JobType(object):
@@ -41,6 +41,7 @@ class MetricsDictKey(object):
 
 
 class DistributionStrategy(object):
+    LOCAL = "Local"
     PARAMETER_SERVER = "ParameterServerStrategy"
     ALLREDUCE = "AllreduceStrategy"
 
@@ -63,3 +64,9 @@ class PodStatus(object):
     FAILED = "Failed"
     RUNNING = "Running"
     FINISHED = "Finished"
+
+
+class ReaderType(object):
+    CSV_READER = "CSV"
+    ODPS_READER = "ODPS"
+    RECORDIO_READER = "RecordIO"

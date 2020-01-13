@@ -53,6 +53,7 @@ class PserverServicerTest(unittest.TestCase):
     ):
         args = PserverArgs(
             grads_to_wait=grads_to_wait,
+            lr_scheduler="learning_rate_scheduler",
             lr_staleness_modulation=lr_staleness_modulation,
             use_async=use_async,
             port=self._port,
@@ -168,7 +169,8 @@ class PserverServicerTest(unittest.TestCase):
             "v0": np.random.rand(3, 2).astype(np.float32),
             "v1": np.random.rand(10, 32).astype(np.float32),
         }
-        pull_req = empty_pb2.Empty()
+        pull_req = elasticdl_pb2.PullVariableRequest()
+        pull_req.current_model_version = -1
         # try to pull variable
         res = self._stub.pull_variable(pull_req)
         # not initialized
@@ -190,6 +192,13 @@ class PserverServicerTest(unittest.TestCase):
             name = param.name
             tensor = tensor_pb_to_ndarray(param)
             self.assertTrue(np.allclose(param0[name], tensor))
+
+        # pull variable again, no param as no updated version
+        pull_req.current_model_version = res.model.version
+        res = self._stub.pull_variable(pull_req)
+        self.assertTrue(res.model_init_status)
+        self.assertEqual(res.model.version, pull_req.current_model_version)
+        self.assertTrue(not res.model.param)
 
     def test_pull_embedding_vector(self):
         self.create_default_server_and_stub()
@@ -480,6 +489,7 @@ class PserverServicerTest(unittest.TestCase):
             model_zoo=_test_model_zoo_path,
             model_def="test_module.custom_model",
             checkpoint_dir_for_init=checkpoint_dir_for_init,
+            lr_scheduler="learning_rate_scheduler",
         )
         pserver_0 = ParameterServer(args)
 
@@ -507,6 +517,7 @@ class PserverServicerTest(unittest.TestCase):
             model_zoo=_test_model_zoo_path,
             model_def="test_module.custom_model",
             checkpoint_dir_for_init=checkpoint_dir_for_init,
+            lr_scheduler="learning_rate_scheduler",
         )
         pserver_1 = ParameterServer(args)
 

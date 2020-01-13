@@ -1,4 +1,5 @@
 import threading
+import time
 from collections import deque
 
 import tensorflow as tf
@@ -6,8 +7,7 @@ import tensorflow as tf
 from elasticdl.proto import elasticdl_pb2
 from elasticdl.python.common.constants import TaskExecCounterKey
 from elasticdl.python.common.log_utils import default_logger as logger
-from elasticdl.python.data.data_reader import create_data_reader
-from elasticdl.python.data.dataset_utils import create_dataset_from_tasks
+from elasticdl.python.data.reader.data_reader_factory import create_data_reader
 
 
 class TaskDataService(object):
@@ -15,16 +15,19 @@ class TaskDataService(object):
         self, worker, training_with_evaluation, data_reader_params=None
     ):
         self._worker = worker
+        self._create_data_reader_fn = create_data_reader
+        if self._worker._custom_data_reader is not None:
+            self._create_data_reader_fn = self._worker._custom_data_reader
         self._training_with_evaluation = training_with_evaluation
         self._lock = threading.Lock()
         self._pending_dataset = True
         self._pending_save_model_task = None
         if data_reader_params:
-            self.data_reader = create_data_reader(
+            self.data_reader = self._create_data_reader_fn(
                 data_origin=None, **data_reader_params
             )
         else:
-            self.data_reader = create_data_reader(data_origin=None)
+            self.data_reader = self._create_data_reader_fn(data_origin=None)
         self._warm_up_task = None
         self._has_warmed_up = False
         self._failed_record_count = 0
@@ -74,6 +77,7 @@ class TaskDataService(object):
         Report the number of records in the latest processed batch,
         so TaskDataService knows if some pending tasks are finished
         and report_task_result to the master.
+        Return True if there are some finished tasks, False otherwise.
         """
         self._reported_record_count += count
         if err_msg:
@@ -99,20 +103,25 @@ class TaskDataService(object):
                     self._failed_record_count = 0
                 if self._pending_tasks:
                     self._current_task = self._pending_tasks[0]
+            return True
+        return False
 
-    def get_validation_dataset(self, eval_task):
+    def get_dataset_gen(self, task):
         """
-        If an evaluation task exists, this creates a `tf.data.Dataset`
-        object as well as its corresponding model version and task_id.
-        Otherwise, this returns `None`.
+        If a task exists, this creates a generator, which could be used to
+        creating a `tf.data.Dataset` object in further.
         """
-        if not eval_task:
+        if not task:
             return None
-        return (
-            create_dataset_from_tasks([eval_task], self.data_reader),
-            eval_task.model_version,
-            eval_task.task_id,
-        )
+        tasks = [task]
+
+        def gen():
+            for task in tasks:
+                for data in self.data_reader.read_records(task):
+                    if data:
+                        yield data
+
+        return gen
 
     def get_save_model_task_and_dataset(self):
         if not self._pending_save_model_task:
@@ -120,7 +129,12 @@ class TaskDataService(object):
 
         task = self._pending_save_model_task
         self._pending_save_model_task = None
-        return task, create_dataset_from_tasks([task], self.data_reader)
+
+        gen = self.get_dataset_gen(task)
+        dataset = tf.data.Dataset.from_generator(
+            gen, self.data_reader.records_output_types
+        )
+        return task, dataset
 
     def get_dataset(self):
         """
@@ -140,11 +154,22 @@ class TaskDataService(object):
             # sure `read_records()` is executed without iterating all the
             # records so this should not be time consuming.
             if self._warm_up_task is None and not self._has_warmed_up:
-                task = self._worker.get_task()
-                self._warm_up_task = task
-                for _ in self.data_reader.read_records(task):
-                    break
-                self._has_warmed_up = True
+                while True:
+                    task = self._worker.get_task()
+                    if task.type != elasticdl_pb2.WAIT:
+                        break
+                    time.sleep(2)
+                if task.type == elasticdl_pb2.SAVE_MODEL:
+                    self._pending_save_model_task = task
+                    return None
+                elif not task.shard_name:
+                    logger.info("No more task, stopping")
+                    return None
+                else:
+                    self._warm_up_task = task
+                    for _ in self.data_reader.read_records(task):
+                        break
+                    self._has_warmed_up = True
             ds = tf.data.Dataset.from_generator(
                 self._gen, self.data_reader.records_output_types
             )
@@ -168,9 +193,7 @@ class TaskDataService(object):
             if not task.shard_name:
                 if task.type == elasticdl_pb2.WAIT:
                     self._pending_dataset = True
-                    logger.info(
-                        "Finish current dataset, maybe more data later"
-                    )
+                    logger.info("No tasks for now, maybe more later")
                 else:
                     logger.info("No more task, stopping")
                 break

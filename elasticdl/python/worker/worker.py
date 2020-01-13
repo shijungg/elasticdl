@@ -5,7 +5,6 @@ import traceback
 
 import numpy as np
 import tensorflow as tf
-from google.protobuf import empty_pb2
 
 from elasticdl.proto import elasticdl_pb2, elasticdl_pb2_grpc
 from elasticdl.python.collective_ops.communicator import CollectiveCommunicator
@@ -22,7 +21,7 @@ from elasticdl.python.common.hash_utils import (
     scatter_embedding_vector,
     string_to_id,
 )
-from elasticdl.python.common.log_utils import default_logger as logger
+from elasticdl.python.common.log_utils import get_logger
 from elasticdl.python.common.model_handler import ModelHandler
 from elasticdl.python.common.model_utils import (
     find_layer,
@@ -36,6 +35,8 @@ from elasticdl.python.common.tensor import (
     serialize_tensor,
     tensor_pb_to_ndarray,
 )
+from elasticdl.python.common.tensor_utils import deduplicate_indexed_slices
+from elasticdl.python.common.timing_utils import Timing
 from elasticdl.python.elasticdl.feature_column import feature_column
 from elasticdl.python.elasticdl.layers.embedding import Embedding
 from elasticdl.python.worker.task_data_service import TaskDataService
@@ -59,6 +60,7 @@ class Worker(object):
         ps_channels=None,
         max_minibatch_retry_num=DEFAULT_MAX_MINIBATCH_RETRY_NUM,
         max_allreduce_retry_num=DEFAULT_MAX_ALLREDUCE_RETRY_NUM,
+        set_parallelism=False,
     ):
         """
         Arguments:
@@ -71,6 +73,17 @@ class Worker(object):
                 training strategy is used.
         """
         self._args = args
+        self.logger = get_logger("Worker", level=args.log_level.upper())
+
+        if set_parallelism:
+            # Explicitly setting the parallelism will avoid multi-process hangs
+            # Maybe due to an unknown bug in Tensorflow?
+            # Must called before TensorFlow is initialized.
+            # Not set_parallelism by default to make unittests happy.
+            num_threads = os.cpu_count()
+            tf.config.threading.set_inter_op_parallelism_threads(num_threads)
+            tf.config.threading.set_intra_op_parallelism_threads(num_threads)
+
         if channel is None:
             self._stub = None
         else:
@@ -85,6 +98,9 @@ class Worker(object):
                     elasticdl_pb2_grpc.PserverStub(c) for c in ps_channels
                 ]
                 self._var_to_ps = {}
+                self._ps_num = len(self._ps_stubs)
+        else:
+            self._ps_num = 0
         self._distribution_strategy = args.distribution_strategy
         if (
             self._distribution_strategy
@@ -98,6 +114,7 @@ class Worker(object):
         self._max_minibatch_retry_num = max_minibatch_retry_num
         self._max_allreduce_retry_num = max_allreduce_retry_num
         self._init_from_args(args)
+        self._timing = Timing(args.log_level.upper() == "DEBUG", self.logger)
 
     def _init_from_args(self, args):
         """
@@ -114,6 +131,7 @@ class Worker(object):
             self._opt_fn,
             self._eval_metrics_fn,
             self._prediction_outputs_processor,
+            self._custom_data_reader,
         ) = get_model_spec(
             model_zoo=args.model_zoo,
             model_def=args.model_def,
@@ -123,6 +141,7 @@ class Worker(object):
             eval_metrics_fn=args.eval_metrics_fn,
             model_params=args.model_params,
             prediction_outputs_processor=args.prediction_outputs_processor,
+            custom_data_reader=args.custom_data_reader,
         )
 
         self._collective_communicator = (
@@ -137,6 +156,7 @@ class Worker(object):
         self.set_model(model_inst)
 
         self._model_version = -1
+        self._model_versions_from_ps = [-1 for _ in range(self._ps_num)]
         self._task_data_service = TaskDataService(
             self,
             self._job_type == JobType.TRAINING_WITH_EVALUATION,
@@ -195,7 +215,7 @@ class Worker(object):
                 for column in layer._feature_columns:
                     if isinstance(column, feature_column.EmbeddingColumn):
                         self._embedding_columns.append(column)
-                        logger.info(
+                        self.logger.info(
                             "Initialize ElasticDL EmbeddingColumn:{}".format(
                                 column.name
                             )
@@ -273,15 +293,16 @@ class Worker(object):
         return self._stub.get_task(req)
 
     def get_model(self):
-        model_version = -1
+        self._timing.start_record_time("get_model")
         variable_future_and_id_pairs = []
-        req = empty_pb2.Empty()
         if self._use_multi_ps:
             self.init_ps_var_partition()
         for ps_id, stub in enumerate(self._ps_stubs):
             if ps_id not in self._ps_vars:
                 continue
             # async grpc call
+            req = elasticdl_pb2.PullVariableRequest()
+            req.current_model_version = self._model_versions_from_ps[ps_id]
             var_future = stub.pull_variable.future(req)
             variable_future_and_id_pairs.append((var_future, ps_id))
 
@@ -290,6 +311,8 @@ class Worker(object):
             if not res.model_init_status:
                 # push variable to ps for initialization
                 self.report_variable_to_ps(ps_id)
+                req = elasticdl_pb2.PullVariableRequest()
+                req.current_model_version = self._model_versions_from_ps[ps_id]
                 res = self._ps_stubs[ps_id].pull_variable(req)
                 if not res.model_init_status:
                     # TODO: support PS fault-tolerance
@@ -300,16 +323,17 @@ class Worker(object):
             for tensor_pb in res.model.param:
                 tensor = Tensor.from_tensor_pb(tensor_pb)
                 self._non_embed_vars[tensor.name].assign(tensor.to_ndarray())
+            self._model_versions_from_ps[ps_id] = res.model.version
 
-            model_version = max(model_version, res.model.version)
-        self._model_version = model_version
+        self._model_version = max(self._model_versions_from_ps)
+        self._timing.end_record_time("get_model")
 
     def pull_embedding_vector(self, layer_name, embedding_ids):
         """Pulls and returns embedding vectors ordered by the embedding ids."""
         ps_ids = {}
         ps_ids_index = {}
         for idx, embedding_id in enumerate(embedding_ids):
-            ps_id = int_to_id(embedding_id, len(self._ps_stubs))
+            ps_id = int_to_id(embedding_id, self._ps_num)
             ps_ids.setdefault(ps_id, []).append(embedding_id)
             ps_ids_index.setdefault(ps_id, []).append(idx)
 
@@ -348,9 +372,7 @@ class Worker(object):
         ps_vars = {}
         for v in self._non_embed_vars.values():
             if v.name not in self._var_to_ps:
-                self._var_to_ps[v.name] = string_to_id(
-                    v.name, len(self._ps_stubs)
-                )
+                self._var_to_ps[v.name] = string_to_id(v.name, self._ps_num)
             ps_id = self._var_to_ps[v.name]
             if ps_id not in ps_vars:
                 ps_vars[ps_id] = [v]
@@ -379,11 +401,12 @@ class Worker(object):
                 # tf.keras.initializers. Keep aligned between these two.
                 embedding_info.initializer = "uniform"
 
-        for ps_id in range(len(self._ps_stubs)):
+        for ps_id in range(self._ps_num):
             self._ps_stubs[ps_id].push_embedding_info(model)
 
     def report_variable_to_ps(self, ps_id):
         model = elasticdl_pb2.Model()
+        model.version = self._model_versions_from_ps[ps_id]
         if ps_id in self._ps_vars:
             vars = self._ps_vars[ps_id]
             for var in vars:
@@ -394,7 +417,7 @@ class Worker(object):
 
     def report_variable(self):
         # TODO: call `push_model` in parallel
-        for ps_id in range(len(self._ps_stubs)):
+        for ps_id in range(self._ps_num):
             self.report_variable_to_ps(ps_id)
 
     def _collect_edl_embedding_name_values(self):
@@ -419,9 +442,9 @@ class Worker(object):
         return embedding_name_values
 
     def report_gradient_to_ps(self, grads):
+        self._timing.start_record_time("report_gradient")
         reqs = [
-            elasticdl_pb2.PushGradientRequest()
-            for i in range(len(self._ps_stubs))
+            elasticdl_pb2.PushGradientRequest() for i in range(self._ps_num)
         ]
         ps_grads = {}
         non_embed_vars_n = len(self._non_embed_vars)
@@ -470,8 +493,15 @@ class Worker(object):
                         g_values = grad
                         g_indices = ids
 
+                # Sum up the values of the duplicated indices in the
+                # gradients. It can reduce the gradient payload of the
+                # dense embedding.
+                g_values, g_indices = deduplicate_indexed_slices(
+                    values=g_values, indices=g_indices
+                )
+
                 results = scatter_embedding_vector(
-                    g_values.numpy(), g_indices.numpy(), len(self._ps_stubs)
+                    g_values.numpy(), g_indices.numpy(), self._ps_num
                 )
 
                 for ps_id in results:
@@ -482,9 +512,9 @@ class Worker(object):
                     )
 
         report_futures = []
-        for ps_id in range(len(self._ps_stubs)):
+        for ps_id in range(self._ps_num):
             req = reqs[ps_id]
-            req.model_version = self._model_version
+            req.model_version = self._model_versions_from_ps[ps_id]
             report_future = self._ps_stubs[ps_id].push_gradient.future(req)
             report_futures.append(report_future)
 
@@ -496,6 +526,7 @@ class Worker(object):
                 accepted = True
             if res.model_version > max_version:
                 max_version = res.model_version
+        self._timing.end_record_time("report_gradient")
         return accepted, max_version
 
     def report_gradient_locally(self, grads):
@@ -539,7 +570,7 @@ class Worker(object):
                 predictions, self._worker_id
             )
         else:
-            logger.warning(
+            self.logger.warning(
                 "prediction_outputs_processor is not "
                 "defined in the model definition. Prediction outputs "
                 "are not processed."
@@ -576,7 +607,7 @@ class Worker(object):
             for layer in self._embedding_layers:
                 if len(layer.embedding_and_ids) > 1:
                     self._train_eagerly = True
-                    logger.warning(
+                    self.logger.warning(
                         "ElasticDL embedding layer %s is called more than "
                         "once, this will make the training process unable "
                         "to accelerate with tf.function." % (layer.name)
@@ -666,7 +697,7 @@ class Worker(object):
     def _broadcast_model_params(self):
         status = self._collective_communicator.barrier()
         if status == CollectiveCommunicatorStatus.FAILED:
-            logger.warning("Failed to perform barrier operation")
+            self.logger.warning("Failed to perform barrier operation")
             return False
         broadcast_root_worker_ip = self._get_ip_of_broadcast_root_worker()
         this_worker_ip = self._get_ip_of_this_worker()
@@ -677,16 +708,16 @@ class Worker(object):
             else None
         )
         status, model_params = self._collective_communicator.broadcast(
-            model_params, broadcast_root_worker_ip,
+            model_params, broadcast_root_worker_ip
         )
         if status == CollectiveCommunicatorStatus.FAILED:
-            logger.warning("Failed to broadcast model parameters")
+            self.logger.warning("Failed to broadcast model parameters")
             return False
         if not is_broadcast_root_worker and model_params is not None:
             self._update_local_model_params(model_params)
         status = self._collective_communicator.barrier()
         if status == CollectiveCommunicatorStatus.FAILED:
-            logger.warning("Failed to perform barrier operation")
+            self.logger.warning("Failed to perform barrier operation")
             return False
         return True
 
@@ -696,7 +727,7 @@ class Worker(object):
         if status == CollectiveCommunicatorStatus.SUCCEEDED:
             accepted, _ = self.report_gradient(averaged_grads)
             if not accepted:
-                logger.warning("Failed to report the averaged gradients")
+                self.logger.warning("Failed to report the averaged gradients")
         return accepted
 
     def _collect_gradients_with_allreduce_robust(self, grads):
@@ -711,7 +742,7 @@ class Worker(object):
                 else:
                     return False
             else:
-                logger.warning(
+                self.logger.warning(
                     "No new worker joining. Broadcast operation skipped"
                 )
                 return False
@@ -735,7 +766,7 @@ class Worker(object):
                 if accepted:
                     return accepted, None, loss
                 else:
-                    logger.warning(
+                    self.logger.warning(
                         "Failed to perform allreduce operation on"
                         "the gradients. Retrying..."
                     )
@@ -776,6 +807,7 @@ class Worker(object):
     ):
         if self._need_embedding_layer_check or not self._var_created:
             self._run_model_call_before_training(features)
+        self._timing.start_record_time("batch_process")
         for _ in range(self._max_minibatch_retry_num):
             if task_type == elasticdl_pb2.EVALUATION:
                 self._run_evaluation_task(features, labels)
@@ -789,7 +821,7 @@ class Worker(object):
                     features, labels
                 )
                 if accepted:
-                    logger.info("Loss is {}".format(loss.numpy()))
+                    self.logger.info("Loss is {}".format(loss.numpy()))
                     break
             elif task_type == elasticdl_pb2.PREDICTION:
                 if self._model_version != min_model_version:
@@ -804,6 +836,7 @@ class Worker(object):
             # TODO: stop the worker if it fails to make any
             #       progress for some time.
             raise RuntimeError("Worker got stuck")
+        self._timing.end_record_time("batch_process")
         return min_model_version
 
     def _process_eval_task(self, task):
@@ -813,17 +846,28 @@ class Worker(object):
             A python bool indicating whether worker processed some evaluation
             tasks.
         """
-        logger.info("the evaluation task_id: %d" % task.task_id)
-        eval_info = self._task_data_service.get_validation_dataset(task)
-        if not eval_info:
-            return
-        (eval_dataset, model_version, task_id) = eval_info
-        eval_dataset = self._dataset_fn(
-            eval_dataset,
-            Mode.EVALUATION,
-            self._task_data_service.data_reader.metadata,
-        )
-        eval_dataset = eval_dataset.batch(self._minibatch_size).prefetch(1)
+        self.logger.info("the evaluation task_id: %d" % task.task_id)
+
+        gen = self._task_data_service.get_dataset_gen(task)
+        if not gen:
+            return None
+
+        def create_dataset():
+            eval_dataset = tf.data.Dataset.from_generator(
+                gen, self._task_data_service.data_reader.records_output_types
+            )
+            eval_dataset = self._dataset_fn(
+                eval_dataset,
+                Mode.EVALUATION,
+                self._task_data_service.data_reader.metadata,
+            )
+            eval_dataset = eval_dataset.batch(self._minibatch_size).prefetch(1)
+            return eval_dataset
+
+        with tf.device("/device:cpu:0"):
+            eval_dataset = create_dataset()
+        model_version = task.model_version
+        task_id = task.task_id
         err_msg = ""
         for dataset_batch in eval_dataset:
             data_err_msg = self._process_minibatch_and_report(
@@ -858,7 +902,7 @@ class Worker(object):
             saved_model_path = os.path.join(
                 saved_model_path, str(int(time.time()))
             )
-            logger.info(
+            self.logger.info(
                 "The path to export model is {}".format(saved_model_path)
             )
             model = self._model_handler.get_model_to_export(
@@ -923,6 +967,7 @@ class Worker(object):
         while True:
             dataset = self._task_data_service.get_dataset()
             if not dataset:
+                self._process_save_model_task_if_needed()
                 break
             dataset = self._dataset_fn(
                 dataset,
@@ -930,6 +975,7 @@ class Worker(object):
                 self._task_data_service.data_reader.metadata,
             )
             dataset = dataset.batch(self._minibatch_size).prefetch(1)
+            self._timing.start_record_time("task_process")
             for dataset_batch in dataset:
                 if self._job_type == JobType.TRAINING_WITH_EVALUATION:
                     # Give the worker a chance to process an evaluation task
@@ -965,9 +1011,12 @@ class Worker(object):
                     last_training_minibatch_failed = False
                     if local_update_count < self._get_model_steps:
                         self._update_local_model()
-                self._task_data_service.report_record_done(
+                if self._task_data_service.report_record_done(
                     self._minibatch_size, err_msg
-                )
+                ):
+                    self._timing.end_record_time("task_process")
+                    self._timing.report_timing(reset=True)
+                    self._timing.start_record_time("task_process")
             del dataset
             # New evaluation tasks may be created after this worker's
             # training tasks are done, as other workers' may still

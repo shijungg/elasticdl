@@ -1,3 +1,4 @@
+import csv
 import os
 import tempfile
 from collections.__init__ import namedtuple
@@ -15,7 +16,7 @@ from elasticdl.python.common.args import parse_worker_args
 from elasticdl.python.common.constants import (
     DistributionStrategy,
     JobType,
-    ODPSConfig,
+    MaxComputeConfig,
 )
 from elasticdl.python.common.grpc_utils import build_channel
 from elasticdl.python.common.model_utils import (
@@ -37,7 +38,9 @@ class PserverArgs(object):
     def __init__(
         self,
         grads_to_wait=8,
+        lr_scheduler="learning_rate_scheduler",
         lr_staleness_modulation=0,
+        sync_version_tolerance=0,
         use_async=False,
         model_zoo=None,
         model_def=None,
@@ -53,10 +56,13 @@ class PserverArgs(object):
         keep_checkpoint_max=0,
         ps_id=0,
         num_ps_pods=1,
+        num_workers=2,
         checkpoint_dir_for_init=None,
     ):
         self.grads_to_wait = grads_to_wait
+        self.learning_rate_scheduler = lr_scheduler
         self.lr_staleness_modulation = lr_staleness_modulation
+        self.sync_version_tolerance = sync_version_tolerance
         self.use_async = use_async
         self.model_zoo = model_zoo
         self.model_def = model_def
@@ -72,6 +78,7 @@ class PserverArgs(object):
         self.keep_checkpoint_max = keep_checkpoint_max
         self.ps_id = ps_id
         self.num_ps_pods = num_ps_pods
+        self.num_workers = num_workers
         self.checkpoint_dir_for_init = checkpoint_dir_for_init
 
 
@@ -153,6 +160,33 @@ def create_recordio_file(size, dataset_name, shape, temp_dir=None):
             )
             f.write(example.SerializeToString())
     return temp_file.name
+
+
+def create_iris_csv_file(size, columns, temp_dir=None):
+    """Creates a temporary CSV file.
+
+    Args:
+        size: The number of records in the CSV file.
+        columns: The names of columns in the CSV file.
+        temp_dir: The storage path of the CSV file.
+
+    Returns:
+        A python string indicating the temporary file name.
+    """
+    temp_file = tempfile.NamedTemporaryFile(delete=False, dir=temp_dir)
+
+    features = np.random.random((size, 4))
+    features = np.round(features, 4)
+    labels = np.random.randint(0, 2, (size, 1))
+    value_data = np.concatenate((features, labels), axis=1)
+
+    csv_file_name = temp_file.name + ".csv"
+    with open(csv_file_name, "w", newline="") as csv_file:
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(columns)
+        csv_writer.writerows(value_data)
+
+    return csv_file_name
 
 
 def create_pserver(
@@ -476,22 +510,22 @@ def create_iris_odps_table(odps_client, project_name, table_name):
 
 
 def get_odps_client_from_env():
-    project = os.environ[ODPSConfig.PROJECT_NAME]
-    access_id = os.environ[ODPSConfig.ACCESS_ID]
-    access_key = os.environ[ODPSConfig.ACCESS_KEY]
-    endpoint = os.environ.get(ODPSConfig.ENDPOINT)
+    project = os.environ[MaxComputeConfig.PROJECT_NAME]
+    access_id = os.environ[MaxComputeConfig.ACCESS_ID]
+    access_key = os.environ[MaxComputeConfig.ACCESS_KEY]
+    endpoint = os.environ.get(MaxComputeConfig.ENDPOINT)
     return ODPS(access_id, access_key, project, endpoint)
 
 
 def create_iris_odps_table_from_env():
-    project = os.environ[ODPSConfig.PROJECT_NAME]
-    table_name = os.environ["ODPS_TABLE_NAME"]
+    project = os.environ[MaxComputeConfig.PROJECT_NAME]
+    table_name = os.environ["MAXCOMPUTE_TABLE"]
     create_iris_odps_table(get_odps_client_from_env(), project, table_name)
 
 
 def delete_iris_odps_table_from_env():
-    project = os.environ[ODPSConfig.PROJECT_NAME]
-    table_name = os.environ["ODPS_TABLE_NAME"]
+    project = os.environ[MaxComputeConfig.PROJECT_NAME]
+    table_name = os.environ["MAXCOMPUTE_TABLE"]
     get_odps_client_from_env().delete_table(
         table_name, project, if_exists=True
     )
