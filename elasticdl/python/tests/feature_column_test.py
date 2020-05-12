@@ -3,7 +3,9 @@ import unittest
 import numpy as np
 import tensorflow as tf
 
-from elasticdl.python.elasticdl.feature_column import feature_column
+from elasticdl.python.elasticdl.feature_column.feature_column import (
+    embedding_column,
+)
 
 
 def call_feature_columns(feature_columns, input):
@@ -34,7 +36,7 @@ class EmbeddingColumnTest(unittest.TestCase):
     def test_call_embedding_column(self):
         dimension = 32
 
-        item_id_embedding = feature_column.embedding_column(
+        item_id_embedding = embedding_column(
             tf.feature_column.categorical_column_with_identity(
                 "item_id", num_buckets=128
             ),
@@ -60,7 +62,7 @@ class EmbeddingColumnTest(unittest.TestCase):
     def test_call_embedding_column_with_weights(self):
         dimension = 8
 
-        item_id_embedding = feature_column.embedding_column(
+        item_id_embedding = embedding_column(
             tf.feature_column.weighted_categorical_column(
                 tf.feature_column.categorical_column_with_identity(
                     "item_id", num_buckets=128
@@ -118,7 +120,7 @@ class EmbeddingColumnTest(unittest.TestCase):
         }
 
         for combiner, expected_grads in combiner_to_expected_grads.items():
-            item_id_embedding = feature_column.embedding_column(
+            item_id_embedding = embedding_column(
                 tf.feature_column.categorical_column_with_identity(
                     "item_id", num_buckets=128
                 ),
@@ -210,7 +212,7 @@ class EmbeddingColumnTest(unittest.TestCase):
         }
 
         for combiner, expected_grads in combiner_to_expected_grads.items():
-            item_id_embedding = feature_column.embedding_column(
+            item_id_embedding = embedding_column(
                 tf.feature_column.weighted_categorical_column(
                     tf.feature_column.categorical_column_with_identity(
                         "item_id", num_buckets=128

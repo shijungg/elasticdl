@@ -107,7 +107,18 @@ def add_common_params(parser):
         help="The repository for generated Docker images, if set, the image "
         "is also pushed to the repository",
     )
-    parser.add_argument("--image_base", help="Base Docker image.")
+    parser.add_argument(
+        "--image_base",
+        default="",
+        help="Base Docker image. If set, a new image will be built each time"
+        "while submitting the Elastic job.",
+    )
+    parser.add_argument(
+        "--image_name",
+        default="",
+        help="The pre-built image for this job. If set, "
+        "use this image instead of building a new one.",
+    )
     parser.add_argument("--job_name", help="ElasticDL job name", required=True)
     parser.add_argument(
         "--master_resource_request",
@@ -150,7 +161,10 @@ def add_common_params(parser):
     parser.add_argument(
         "--worker_pod_priority",
         default="",
-        help="The requested priority of worker pod",
+        help="The requested priority of worker pod, we support following"
+        "configs: high/low/high=0.5. The high=0.5 means that half"
+        "worker pods have high priority, and half worker pods have"
+        "low priority. The default value is low",
     )
     parser.add_argument(
         "--num_ps_pods", type=int, help="Number of PS pods", default=1
@@ -226,7 +240,8 @@ def add_common_params(parser):
     )
     parser.add_argument(
         "--cluster_spec",
-        help="The file that contains user-defined cluster specification",
+        help="The file that contains user-defined cluster specification,"
+        "the file path can be accessed by ElasticDL client.",
         default="",
     )
     parser.add_argument(
@@ -248,6 +263,37 @@ def add_common_params(parser):
         "Note that, if users specify --yaml, the client wouldn't submit "
         "the job automatically, and users need to launch the job through "
         "command `kubectl create -f path_to_yaml_file`.",
+    )
+    add_bool_param(
+        parser=parser,
+        name="--force_use_kube_config_file",
+        default=False,
+        help="If true, force to load the cluster config from ~/.kube/config "
+        "while submitting the ElasticDL job. Otherwise, if the client is in a "
+        "K8S environment, load the incluster config, if not, load the kube "
+        "config file.",
+    )
+    # delete this argument after finishing Go-based PS implementation
+    add_bool_param(
+        parser=parser,
+        name="--use_go_ps",
+        default=False,
+        help="True for Go-based PS, False for Python-based PS",
+    )
+    parser.add_argument(
+        "--aux_params",
+        type=str,
+        default="",
+        help="Auxiliary parameters for misc purposes such as debugging."
+        "The auxiliary parameters in a string separated "
+        'by semi-colon used to debug , e.g. "param1=1; param2=2" '
+        "Supported auxiliary parameters: disable_relaunch",
+    )
+    parser.add_argument(
+        "--log_file_path",
+        type=str,
+        default="",
+        help="The path to save logs (e.g. stdout, stderr)",
     )
 
 
@@ -311,17 +357,18 @@ def add_train_params(parser):
         default="",
     )
     parser.add_argument(
-        "--output",
-        type=str,
-        default="",
-        help="The path to save the final trained model",
-    )
-    parser.add_argument(
         "--sync_version_tolerance",
         type=int,
         help="The maximum model version difference between reported gradients "
         "and PS that synchronous SGD can accepts.",
         default=0,
+    )
+    parser.add_argument(
+        "--log_loss_steps",
+        type=int,
+        help="The frequency, in number of global steps, that the global step "
+        "and the loss will be logged during training.",
+        default=100,
     )
     add_bool_param(
         parser=parser,
@@ -333,7 +380,7 @@ def add_train_params(parser):
         parser=parser,
         name="--lr_staleness_modulation",
         default=False,
-        help="If True, master will modulate the learning rate with staleness "
+        help="If True, PS will modulate the learning rate with staleness "
         "in asynchronous SGD",
     )
 
@@ -435,7 +482,9 @@ def add_common_args_between_master_and_worker(parser):
     parser.add_argument(
         "--model_zoo",
         help="The directory that contains user-defined model files "
-        "or a specific model file",
+        "or a specific model file. If set `image_base`, the path should"
+        "be accessed by ElasticDL client. If set `image_name`, it is"
+        "the path inside this pre-built image.",
         required=True,
     )
     parser.add_argument(
@@ -464,12 +513,11 @@ def add_common_args_between_master_and_worker(parser):
         help="The name of the optimizer defined in the model file",
     )
     parser.add_argument(
-        "--learning_rate_scheduler",
+        "--callbacks",
         type=str,
-        default="learning_rate_scheduler",
-        help="Optional callable learning rate scheduler defined in"
-        "the model file, which takes model version as its input and"
-        "returns a learning rate value",
+        default="callbacks",
+        help="Optional function to add callbacks to behavior during"
+        "training, evaluation and inference.",
     )
     parser.add_argument(
         "--eval_metrics_fn",
@@ -543,6 +591,12 @@ def add_common_args_between_master_and_worker(parser):
         help="The maximum number of recent checkpoint files to keep."
         "If 0, keep all.",
         default=0,
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="",
+        help="The path to save the final trained model",
     )
 
 
@@ -635,6 +689,7 @@ def parse_ps_args(ps_args=None):
 def parse_worker_args(worker_args=None):
     parser = argparse.ArgumentParser(description="ElasticDL Worker")
     add_common_args_between_master_and_worker(parser)
+    add_train_params(parser)
     parser.add_argument(
         "--worker_id", help="ID unique to the worker", type=int, required=True
     )
@@ -651,6 +706,13 @@ def parse_worker_args(worker_args=None):
         type=str,
         help="Addresses of parameter service pods, separated by comma",
     )
+    parser.add_argument(
+        "--collective_communicator_service_name",
+        default="",
+        type=str,
+        help="The name of the collective communicator k8s service for "
+        "allreduce-based training",
+    )
 
     if worker_args:
         worker_args = list(map(str, worker_args))
@@ -658,6 +720,8 @@ def parse_worker_args(worker_args=None):
     print_args(args, groups=ALL_ARGS_GROUPS)
     if unknown_args:
         logger.warning("Unknown arguments: %s", unknown_args)
+    if args.distribution_strategy == DistributionStrategy.ALLREDUCE:
+        args.ps_addrs = ""
     return args
 
 
@@ -683,3 +747,38 @@ def build_arguments_from_parsed_result(args, filter_args=None):
         "--" + k if i % 2 == 0 else k for i, k in enumerate(arguments)
     ]
     return arguments
+
+
+def wrap_python_args_with_string(args):
+    """Wrap argument values with string
+    Args:
+        args: list like ["--foo", "3", "--bar", False]
+
+    Returns:
+        list of string: like ["--foo", "'3'", "--bar", "'False'"]
+    """
+    result = []
+    for value in args:
+        if "--" not in value:
+            result.append("'{}'".format(value))
+        else:
+            result.append(value)
+    return result
+
+
+def wrap_go_args_with_string(args):
+    """Wrap argument values with string
+    Args:
+        args: list like ["--foo=3", "--bar=False"]
+
+    Returns:
+        list of string: like ["--foo='3'", "--bar='False'"]
+    """
+    result = []
+    for value in args:
+        equal_mark_index = value.index("=")
+        arg_value_index = equal_mark_index + 1
+        result.append(
+            value[0:equal_mark_index] + "='{}'".format(value[arg_value_index:])
+        )
+    return result

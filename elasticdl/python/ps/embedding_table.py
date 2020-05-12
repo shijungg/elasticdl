@@ -1,8 +1,10 @@
+import threading
+
 import numpy as np
 import tensorflow as tf
 
 from elasticdl.proto.elasticdl_pb2 import EmbeddingTableInfo
-from elasticdl.python.common.tensor import Tensor
+from elasticdl.python.common.dtypes import dtype_numpy_to_tensor
 
 
 class EmbeddingTable(object):
@@ -32,6 +34,8 @@ class EmbeddingTable(object):
         self.name = name
         self.dim = dim
         self.initializer_value = initializer
+        # set dtype to float32
+        self.dtype = np.dtype("float32")
         if is_slot:
             self.initializer = tf.keras.initializers.Constant(
                 float(self.initializer_value)
@@ -42,6 +46,7 @@ class EmbeddingTable(object):
             )
         self.is_slot = is_slot
         self.embedding_vectors = {}
+        self._lock = threading.Lock()
 
     def get(self, indices):
         if len(indices) == 0:
@@ -50,8 +55,9 @@ class EmbeddingTable(object):
         for i in indices:
             value = self.embedding_vectors.get(i, None)
             if value is None:
-                value = self.initializer(shape=(self.dim,)).numpy()
-                self.embedding_vectors[i] = value
+                with self._lock:
+                    value = self.initializer(shape=(self.dim,)).numpy()
+                    self.embedding_vectors[i] = value
             values.append(value)
         return np.stack(values)
 
@@ -64,17 +70,15 @@ class EmbeddingTable(object):
     def clear(self):
         self.embedding_vectors.clear()
 
-    def to_tensor(self):
-        """Convert the embedding table to elasticDL Tensor"""
+    def to_indexed_slices(self):
         indices = []
         embedding_vectors = []
-        for id, embedding_vector in self.embedding_vectors.items():
-            indices.append(id)
-            embedding_vectors.append(embedding_vector)
-        return Tensor(
-            values=np.array(embedding_vectors),
-            indices=np.array(indices),
-            name=self.name,
+        with self._lock:
+            for id, embedding_vector in self.embedding_vectors.items():
+                indices.append(id)
+                embedding_vectors.append(embedding_vector)
+        return tf.IndexedSlices(
+            values=np.array(embedding_vectors), indices=np.array(indices)
         )
 
     def to_embedding_table_info_pb(self):
@@ -83,6 +87,7 @@ class EmbeddingTable(object):
         embedding_pb.name = self.name
         embedding_pb.dim = self.dim
         embedding_pb.initializer = str(self.initializer_value)
+        embedding_pb.dtype = dtype_numpy_to_tensor(self.dtype)
         return embedding_pb
 
     def get_table_size(self):

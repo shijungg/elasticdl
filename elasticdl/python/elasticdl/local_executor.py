@@ -6,6 +6,7 @@ import tensorflow as tf
 
 from elasticdl.python.common.args import parse_envs
 from elasticdl.python.common.constants import MetricsDictKey
+from elasticdl.python.common.evaluation_utils import EvaluationMetrics
 from elasticdl.python.common.log_utils import default_logger as logger
 from elasticdl.python.common.model_utils import (
     get_dict_from_params_str,
@@ -15,7 +16,6 @@ from elasticdl.python.data.reader.csv_reader import CSVDataReader
 from elasticdl.python.data.reader.data_reader_factory import create_data_reader
 from elasticdl.python.data.reader.odps_reader import ODPSDataReader
 from elasticdl.python.data.reader.recordio_reader import RecordIODataReader
-from elasticdl.python.master.evaluation_service import EvaluationJob
 
 _MockedTask = namedtuple("Task", ["shard_name", "start", "end"])
 
@@ -37,6 +37,7 @@ class LocalExecutor:
             self.eval_metrics_fn,
             self.prediction_outputs_processor,
             self.custom_data_reader,
+            self.callback_list,
         ) = get_model_spec(
             model_zoo=args.model_zoo,
             model_def=args.model_def,
@@ -46,7 +47,8 @@ class LocalExecutor:
             eval_metrics_fn=args.eval_metrics_fn,
             model_params=args.model_params,
             prediction_outputs_processor="",
-            custom_data_reader="",
+            custom_data_reader=args.custom_data_reader,
+            callbacks=args.callbacks,
         )
         self.opt = self.opt_fn()
         self.epoch = args.num_epochs
@@ -58,13 +60,20 @@ class LocalExecutor:
         self.records_per_task = (
             args.minibatch_size * args.num_minibatches_per_task
         )
-        self.data_reader = create_data_reader(
+
+        create_data_reader_fn = (
+            create_data_reader
+            if self.custom_data_reader is None
+            else self.custom_data_reader
+        )
+        self.data_reader = create_data_reader_fn(
             data_origin=args.training_data,
             records_per_task=self.records_per_task,
             **self.data_reader_params
         )
         self.training_data = args.training_data
         self.validation_data = args.validation_data
+        self.save_model_dir = args.output
 
     def _init_environment(self, envs):
         for key, value in envs.items():
@@ -93,6 +102,8 @@ class LocalExecutor:
             self._evaluate(validation_dataset)
             logger.info("Epoch {} end".format(epoch))
             epoch += 1
+        if self.save_model_dir != "":
+            tf.saved_model.save(self.model_inst, self.save_model_dir)
 
     def _train(self, features, labels):
         with tf.GradientTape() as tape:
@@ -109,13 +120,13 @@ class LocalExecutor:
         if dataset is None:
             logger.info("No validation dataset is configured")
             return
-        eval_job = EvaluationJob(self.eval_metrics_fn(), -1)
+        eval_metrics = EvaluationMetrics(self.eval_metrics_fn())
         for features, labels in dataset:
             outputs = self.model_inst.call(features)
             if not isinstance(outputs, dict):
                 outputs = {MetricsDictKey.MODEL_OUTPUT: outputs}
-            eval_job.update_evaluation_metrics(outputs, labels)
-        metrics = eval_job.get_evaluation_summary()
+            eval_metrics.update_evaluation_metrics(outputs, labels)
+        metrics = eval_metrics.get_evaluation_summary()
         logger.info("Evaluation metrics : {}".format(metrics))
         return metrics
 

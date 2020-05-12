@@ -13,9 +13,10 @@ from elasticdl.python.common.model_utils import (
     load_module,
 )
 from elasticdl.python.common.save_utils import CheckpointSaver
-from elasticdl.python.common.tensor import (
-    emplace_tensor_pb_from_ndarray,
-    tensor_pb_to_ndarray,
+from elasticdl.python.common.tensor_utils import (
+    pb_to_ndarray,
+    serialize_indexed_slices,
+    serialize_ndarray,
 )
 from elasticdl.python.ps.embedding_table import (
     EmbeddingTable,
@@ -53,7 +54,6 @@ class PserverServicerTest(unittest.TestCase):
     ):
         args = PserverArgs(
             grads_to_wait=grads_to_wait,
-            lr_scheduler="learning_rate_scheduler",
             lr_staleness_modulation=lr_staleness_modulation,
             use_async=use_async,
             port=self._port,
@@ -82,9 +82,9 @@ class PserverServicerTest(unittest.TestCase):
         pull_req = elasticdl_pb2.PullEmbeddingVectorRequest()
         pull_req.name = name
         pull_req.ids.extend(ids)
-        res = self._stub.pull_embedding_vector(pull_req)
-        if res.content:
-            return tensor_pb_to_ndarray(res)
+        res = self._stub.pull_embedding_vectors(pull_req)
+        if res.tensor_content:
+            return pb_to_ndarray(res)
         else:
             return None
 
@@ -114,10 +114,8 @@ class PserverServicerTest(unittest.TestCase):
             req = elasticdl_pb2.Model()
             req.version = idx + 1
             for name in model:
-                emplace_tensor_pb_from_ndarray(
-                    req.param, model[name], name=name
-                )
-            req.embedding_table_info.append(self._embedding_info)
+                serialize_ndarray(model[name], req.dense_parameters[name])
+            req.embedding_table_infos.append(self._embedding_info)
             res = self._stub.push_model(req)
             self.assertEqual(res, empty_pb2.Empty())
             # self._parameters is initialized with the first push_model call
@@ -163,44 +161,43 @@ class PserverServicerTest(unittest.TestCase):
                     (embedding - slot_init_value[slot_name] < 0.0001).all()
                 )
 
-    def test_pull_variable(self):
+    def test_pull_dense_parameters(self):
         self.create_default_server_and_stub()
         param0 = {
             "v0": np.random.rand(3, 2).astype(np.float32),
             "v1": np.random.rand(10, 32).astype(np.float32),
         }
-        pull_req = elasticdl_pb2.PullVariableRequest()
-        pull_req.current_model_version = -1
+        pull_req = elasticdl_pb2.PullDenseParametersRequest()
+        pull_req.version = -1
         # try to pull variable
-        res = self._stub.pull_variable(pull_req)
+        res = self._stub.pull_dense_parameters(pull_req)
         # not initialized
-        self.assertFalse(res.model_init_status)
+        self.assertFalse(res.initialized)
 
         # init variable
         req = elasticdl_pb2.Model()
         req.version = 1
         for name, var in param0.items():
-            emplace_tensor_pb_from_ndarray(req.param, var, name=name)
+            serialize_ndarray(var, req.dense_parameters[name])
         res = self._stub.push_model(req)
         self.assertEqual(res, empty_pb2.Empty())
 
         # pull variable back
-        res = self._stub.pull_variable(pull_req)
-        self.assertTrue(res.model_init_status)
-        self.assertEqual(res.model.version, req.version)
-        for param in res.model.param:
-            name = param.name
-            tensor = tensor_pb_to_ndarray(param)
+        res = self._stub.pull_dense_parameters(pull_req)
+        self.assertTrue(res.initialized)
+        self.assertEqual(res.version, req.version)
+        for name, pb in res.dense_parameters.items():
+            tensor = pb_to_ndarray(pb)
             self.assertTrue(np.allclose(param0[name], tensor))
 
         # pull variable again, no param as no updated version
-        pull_req.current_model_version = res.model.version
-        res = self._stub.pull_variable(pull_req)
-        self.assertTrue(res.model_init_status)
-        self.assertEqual(res.model.version, pull_req.current_model_version)
-        self.assertTrue(not res.model.param)
+        pull_req.version = res.version
+        res = self._stub.pull_dense_parameters(pull_req)
+        self.assertTrue(res.initialized)
+        self.assertEqual(res.version, pull_req.version)
+        self.assertTrue(not res.dense_parameters)
 
-    def test_pull_embedding_vector(self):
+    def test_pull_embedding_vectors(self):
         self.create_default_server_and_stub()
 
         id_list_0 = [1, 3, 9, 6]
@@ -208,12 +205,12 @@ class PserverServicerTest(unittest.TestCase):
 
         req = elasticdl_pb2.Model()
         req.version = 1
-        req.embedding_table_info.append(self._embedding_info)
+        req.embedding_table_infos.append(self._embedding_info)
         another_embedding_info = elasticdl_pb2.EmbeddingTableInfo()
         another_embedding_info.name = "layer_b"
         another_embedding_info.dim = 16
         another_embedding_info.initializer = "normal"
-        req.embedding_table_info.append(another_embedding_info)
+        req.embedding_table_infos.append(another_embedding_info)
         res = self._stub.push_model(req)
         self.assertEqual(res, empty_pb2.Empty())
 
@@ -280,10 +277,8 @@ class PserverServicerTest(unittest.TestCase):
         push_model_req = elasticdl_pb2.Model()
         push_model_req.version = self._parameters.version
         for name, value in zip(self.var_names, self.var_values):
-            emplace_tensor_pb_from_ndarray(
-                push_model_req.param, value, name=name
-            )
-        push_model_req.embedding_table_info.append(self._embedding_info)
+            serialize_ndarray(value, push_model_req.dense_parameters[name])
+        push_model_req.embedding_table_infos.append(self._embedding_info)
         self._stub.push_model(push_model_req)
 
         for name, var in zip(self.var_names, self.var_values):
@@ -298,18 +293,16 @@ class PserverServicerTest(unittest.TestCase):
         self.push_gradient_test_setup()
 
         # Test applying gradients to embedding and non-embedding parameters
-        req = elasticdl_pb2.PushGradientRequest()
+        req = elasticdl_pb2.PushGradientsRequest()
         for g, name in zip(self.grad_values0, self.var_names):
-            emplace_tensor_pb_from_ndarray(req.gradients, g, name=name)
-        emplace_tensor_pb_from_ndarray(
-            req.gradients,
-            values=self.embedding_grads0.values,
-            indices=self.embedding_grads0.indices,
-            name=self._embedding_info.name,
+            serialize_ndarray(g, req.gradients.dense_parameters[name])
+        serialize_indexed_slices(
+            self.embedding_grads0,
+            req.gradients.embedding_tables[self._embedding_info.name],
         )
-        res = self._stub.push_gradient(req)
+        res = self._stub.push_gradients(req)
         self.assertEqual(res.accepted, True)
-        self.assertEqual(res.model_version, 1)
+        self.assertEqual(res.version, 1)
         expected_values = [
             v - self._lr * g
             for v, g in zip(self.var_values, self.grad_values0)
@@ -336,18 +329,16 @@ class PserverServicerTest(unittest.TestCase):
         # Test applying gradients with same name
         for name, var in zip(self.var_names, self.var_values):
             self._parameters.non_embedding_params[name] = tf.Variable(var)
-        req = elasticdl_pb2.PushGradientRequest()
-        for g in self.grad_values1:
-            emplace_tensor_pb_from_ndarray(
-                req.gradients, g, name=self.var_names[0]
-            )
-        res = self._stub.push_gradient(req)
+        req = elasticdl_pb2.PushGradientsRequest()
+        serialize_ndarray(
+            self.grad_values1[1],
+            req.gradients.dense_parameters[self.var_names[0]],
+        )
+        res = self._stub.push_gradients(req)
         self.assertEqual(res.accepted, True)
-        self.assertEqual(res.model_version, 2)
+        self.assertEqual(res.version, 2)
         expected_values = [
-            self.var_values[0]
-            - self._lr * self.grad_values1[0]
-            - self._lr * self.grad_values1[1],
+            self.var_values[0] - self._lr * self.grad_values1[1],
             self.var_values[1],
         ]
         for expected_value, name in zip(expected_values, self.var_names):
@@ -364,41 +355,38 @@ class PserverServicerTest(unittest.TestCase):
         )
         self.push_gradient_test_setup()
 
-        req = elasticdl_pb2.PushGradientRequest()
-        req.model_version = 0
+        req = elasticdl_pb2.PushGradientsRequest()
+        req.gradients.version = 0
         for g, name in zip(self.grad_values0, self.var_names):
-            emplace_tensor_pb_from_ndarray(req.gradients, g, name=name)
-        emplace_tensor_pb_from_ndarray(
-            req.gradients,
-            values=self.embedding_grads0.values,
-            indices=self.embedding_grads0.indices,
-            name=self._embedding_info.name,
+            serialize_ndarray(g, req.gradients.dense_parameters[name])
+        serialize_indexed_slices(
+            self.embedding_grads0,
+            req.gradients.embedding_tables[self._embedding_info.name],
         )
-        res = self._stub.push_gradient(req)
-        self.assertEqual(res.accepted, True)
-        self.assertEqual(res.model_version, 0)
 
-        req = elasticdl_pb2.PushGradientRequest()
-        req.model_version = 0
+        res = self._stub.push_gradients(req)
+        self.assertEqual(res.accepted, True)
+        self.assertEqual(res.version, 0)
+
+        req = elasticdl_pb2.PushGradientsRequest()
+        req.gradients.version = 0
         for g, name in zip(self.grad_values1, self.var_names):
-            emplace_tensor_pb_from_ndarray(req.gradients, g, name=name)
-        emplace_tensor_pb_from_ndarray(
-            req.gradients,
-            values=self.embedding_grads1.values,
-            indices=self.embedding_grads1.indices,
-            name=self._embedding_info.name,
+            serialize_ndarray(g, req.gradients.dense_parameters[name])
+        serialize_indexed_slices(
+            self.embedding_grads1,
+            req.gradients.embedding_tables[self._embedding_info.name],
         )
-        res = self._stub.push_gradient(req)
+        res = self._stub.push_gradients(req)
         self.assertEqual(res.accepted, True)
-        self.assertEqual(res.model_version, 1)
+        self.assertEqual(res.version, 1)
 
-        req = elasticdl_pb2.PushGradientRequest()
-        req.model_version = 0
+        req = elasticdl_pb2.PushGradientsRequest()
+        req.gradients.version = 0
         for g, name in zip(self.grad_values1, self.var_names):
-            emplace_tensor_pb_from_ndarray(req.gradients, g, name=name)
-        res = self._stub.push_gradient(req)
+            serialize_ndarray(g, req.gradients.dense_parameters[name])
+        res = self._stub.push_gradients(req)
         self.assertEqual(res.accepted, False)
-        self.assertEqual(res.model_version, 1)
+        self.assertEqual(res.version, 1)
 
         expected_values = [
             self.var_values[0]
@@ -479,17 +467,27 @@ class PserverServicerTest(unittest.TestCase):
             )
 
     def test_restore_parameters_from_checkpoint(self):
-        checkpoint_dir_for_init = (
-            "elasticdl/python/tests/testdata/functional_ckpt/version-100"
+        checkpoint_dir = "elasticdl/python/tests/testdata/ps_ckpt"
+        checkpoint_saver = CheckpointSaver(checkpoint_dir, 0, 0, False)
+        params = Parameters()
+        table = EmbeddingTable("embedding", 2, "random_uniform")
+        table.set([0, 1, 2, 3], np.ones((4, 2), dtype=np.float32))
+        params.embedding_params["embedding"] = table
+        params.non_embedding_params["dense/kernel:0"] = tf.Variable(
+            [[1.0], [1.0]]
         )
+        params.non_embedding_params["dense/bias:0"] = tf.Variable([1.0])
+        params.version = 100
+        model_pb = params.to_model_pb()
+        checkpoint_saver.save(100, model_pb, False)
 
+        checkpoint_dir_for_init = checkpoint_dir + "/version-100"
         args = PserverArgs(
             ps_id=0,
             num_ps_pods=2,
             model_zoo=_test_model_zoo_path,
             model_def="test_module.custom_model",
             checkpoint_dir_for_init=checkpoint_dir_for_init,
-            lr_scheduler="learning_rate_scheduler",
         )
         pserver_0 = ParameterServer(args)
 
@@ -517,7 +515,6 @@ class PserverServicerTest(unittest.TestCase):
             model_zoo=_test_model_zoo_path,
             model_def="test_module.custom_model",
             checkpoint_dir_for_init=checkpoint_dir_for_init,
-            lr_scheduler="learning_rate_scheduler",
         )
         pserver_1 = ParameterServer(args)
 

@@ -5,7 +5,8 @@ import tensorflow as tf
 from tensorflow.keras.metrics import Accuracy, MeanSquaredError
 
 from elasticdl.python.common.constants import MetricsDictKey
-from elasticdl.python.common.tensor import Tensor
+from elasticdl.python.common.evaluation_utils import EvaluationMetrics
+from elasticdl.python.common.tensor_utils import ndarray_to_pb
 from elasticdl.python.master.evaluation_service import (
     EvaluationJob,
     EvaluationService,
@@ -57,34 +58,25 @@ class EvaluationServiceTest(unittest.TestCase):
         latest_chkp_version = job.model_version + 1
         self.assertTrue(self.ok_to_new_job(job, latest_chkp_version))
 
-        model_outputs = [
-            Tensor(
-                np.array([[1], [6], [3]], np.float32),
-                name=MetricsDictKey.MODEL_OUTPUT,
-            ).to_tensor_pb()
-        ]
-        labels = Tensor(np.array([[1], [0], [3]], np.float32)).to_tensor_pb()
+        model_outputs = {}
+        model_outputs[MetricsDictKey.MODEL_OUTPUT] = ndarray_to_pb(
+            np.array([[1], [6], [3]], np.float32)
+        )
+        labels = ndarray_to_pb(np.array([[1], [0], [3]], np.float32))
         job.report_evaluation_metrics(model_outputs, labels)
         job.report_evaluation_metrics(
-            [
-                Tensor(
-                    np.array([[4], [5], [6], [7], [8]], np.float32),
-                    name=MetricsDictKey.MODEL_OUTPUT,
-                ).to_tensor_pb()
-            ],
-            Tensor(
-                np.array([[7], [8], [9], [10], [11]], np.float32)
-            ).to_tensor_pb(),
+            {
+                MetricsDictKey.MODEL_OUTPUT: ndarray_to_pb(
+                    np.array([[4], [5], [6], [7], [8]], np.float32)
+                )
+            },
+            ndarray_to_pb(np.array([[7], [8], [9], [10], [11]], np.float32)),
         )
         expected_acc = 0.25
-        evaluation_metrics = job.get_evaluation_summary()
-        self.assertAlmostEqual(
-            expected_acc, evaluation_metrics.get("acc").numpy()
-        )
-        self.assertAlmostEqual(
-            expected_acc, evaluation_metrics.get("acc_fn").numpy()
-        )
-        self.assertAlmostEqual(10.125, evaluation_metrics.get("mse").numpy())
+        evaluation_metrics = job.evaluation_metrics.get_evaluation_summary()
+        self.assertAlmostEqual(expected_acc, evaluation_metrics.get("acc"))
+        self.assertAlmostEqual(expected_acc, evaluation_metrics.get("acc_fn"))
+        self.assertAlmostEqual(10.125, evaluation_metrics.get("mse"))
 
     def testEvaluationService(self):
         task_d = _TaskDispatcher(
@@ -187,7 +179,7 @@ class EvaluationServiceTest(unittest.TestCase):
         auc_value_0 = auc.result()
 
         auc.reset_states()
-        EvaluationJob._update_metric_by_small_chunk(auc, labels, preds)
+        EvaluationMetrics._update_metric_by_small_chunk(auc, labels, preds)
         auc_value_1 = auc.result()
         self.assertEquals(auc_value_0, auc_value_1)
 

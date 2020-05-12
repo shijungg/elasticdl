@@ -23,13 +23,14 @@ from elasticdl.python.common.model_utils import (
     get_module_file_path,
     load_module,
 )
+from elasticdl.python.common.save_utils import CheckpointSaver
 from elasticdl.python.data.recordio_gen.frappe_recordio_gen import (
     load_raw_data,
 )
 from elasticdl.python.master.evaluation_service import EvaluationService
 from elasticdl.python.master.servicer import MasterServicer
 from elasticdl.python.master.task_dispatcher import _TaskDispatcher
-from elasticdl.python.ps.parameter_server import ParameterServer
+from elasticdl.python.ps.parameter_server import Parameters, ParameterServer
 from elasticdl.python.tests.in_process_master import InProcessMaster
 from elasticdl.python.worker.worker import Worker
 
@@ -38,7 +39,6 @@ class PserverArgs(object):
     def __init__(
         self,
         grads_to_wait=8,
-        lr_scheduler="learning_rate_scheduler",
         lr_staleness_modulation=0,
         sync_version_tolerance=0,
         use_async=False,
@@ -60,7 +60,6 @@ class PserverArgs(object):
         checkpoint_dir_for_init=None,
     ):
         self.grads_to_wait = grads_to_wait
-        self.learning_rate_scheduler = lr_scheduler
         self.lr_staleness_modulation = lr_staleness_modulation
         self.sync_version_tolerance = sync_version_tolerance
         self.use_async = use_async
@@ -87,6 +86,7 @@ class DatasetName(object):
     FRAPPE = "frappe1"
     TEST_MODULE = "test_module1"
     IMAGE_DEFAULT = "image_default1"
+    CENSUS = "census1"
 
 
 def create_recordio_file(size, dataset_name, shape, temp_dir=None):
@@ -150,6 +150,60 @@ def create_recordio_file(size, dataset_name, shape, temp_dir=None):
                     ),
                     "label": tf.train.Feature(
                         int64_list=tf.train.Int64List(value=[label])
+                    ),
+                }
+            elif dataset_name == DatasetName.CENSUS:
+                example_dict = {
+                    "workclass": tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[b"Private"])
+                    ),
+                    "education": tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[b"HS-grad"])
+                    ),
+                    "marital-status": tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[b"Widowed"])
+                    ),
+                    "occupation": tf.train.Feature(
+                        bytes_list=tf.train.BytesList(
+                            value=[b"Exec-managerial"]
+                        )
+                    ),
+                    "relationship": tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[b"Not-in-family"])
+                    ),
+                    "race": tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[b"White"])
+                    ),
+                    "sex": tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[b"Female"])
+                    ),
+                    "native-country": tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[b"United-States"])
+                    ),
+                    "age": tf.train.Feature(
+                        float_list=tf.train.FloatList(
+                            value=[np.random.randint(10, 100)]
+                        )
+                    ),
+                    "capital-gain": tf.train.Feature(
+                        float_list=tf.train.FloatList(
+                            value=[np.random.randint(100, 4000)]
+                        )
+                    ),
+                    "capital-loss": tf.train.Feature(
+                        float_list=tf.train.FloatList(
+                            value=[np.random.randint(2000, 7000)]
+                        )
+                    ),
+                    "hours-per-week": tf.train.Feature(
+                        float_list=tf.train.FloatList(
+                            value=[np.random.randint(10, 70)]
+                        )
+                    ),
+                    "label": tf.train.Feature(
+                        int64_list=tf.train.Int64List(
+                            value=[np.random.randint(0, 2)]
+                        )
                     ),
                 }
             else:
@@ -576,3 +630,13 @@ def get_frappe_dataset(batch_size):
     test_db = tf.data.Dataset.from_tensor_slices((x_test, y_test))
     test_db = test_db.batch(batch_size)
     return db, test_db
+
+
+def save_checkpoint_without_embedding(model, checkpoint_dir, version=100):
+    checkpoint_saver = CheckpointSaver(checkpoint_dir, 0, 0, False)
+    params = Parameters()
+    for var in model.trainable_variables:
+        params.non_embedding_params[var.name] = var
+    params.version = version
+    model_pb = params.to_model_pb()
+    checkpoint_saver.save(version, model_pb, False)

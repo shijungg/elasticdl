@@ -11,6 +11,10 @@ from tensorflow.keras.layers import (
 
 from elasticdl.python.common.constants import Mode
 from elasticdl.python.data.reader.recordio_reader import RecordIODataReader
+from elasticdl.python.elasticdl.callbacks import (
+    LearningRateScheduler,
+    MaxStepsStopping,
+)
 
 AUC_metric = None
 
@@ -121,6 +125,15 @@ def eval_metrics_fn():
         },
         "probs": {"auc": tf.keras.metrics.AUC()},
     }
+
+
+def callbacks():
+    def _schedule(model_version):
+        return 0.5 if model_version < 100 else 0.2
+
+    learning_reate_scheduler = LearningRateScheduler(_schedule)
+    max_steps_stopping = MaxStepsStopping(max_steps=200)
+    return [max_steps_stopping, learning_reate_scheduler]
 
 
 CustomDataReader = RecordIODataReader

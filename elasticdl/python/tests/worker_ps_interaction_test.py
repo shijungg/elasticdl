@@ -167,7 +167,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
 
         result_dict = {}
         for layer in layers:
-            embedding = worker.pull_embedding_vector(layer, ids)
+            embedding = worker.pull_embedding_vectors(layer, ids)
             result_dict[layer] = embedding
 
         for layer in layers:
@@ -222,6 +222,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
             eval_metrics_fn,
             prediction_outputs_processor,
             create_data_reader_fn,
+            callback_list,
         ) = get_model_spec(
             model_zoo=self._model_zoo_path,
             model_def=model_def,
@@ -232,6 +233,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
             eval_metrics_fn="eval_metrics_fn",
             prediction_outputs_processor="PredictionOutputsProcessor",
             custom_data_reader="custom_data_reader",
+            callbacks="callbacks",
         )
 
         with tf.GradientTape() as tape:
@@ -272,6 +274,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
             eval_metrics_fn,
             prediction_outputs_processor,
             create_data_reader_fn,
+            callbacks_list,
         ) = get_model_spec(
             model_zoo=self._model_zoo_path,
             model_def=model_def,
@@ -282,6 +285,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
             eval_metrics_fn="eval_metrics_fn",
             prediction_outputs_processor="PredictionOutputsProcessor",
             custom_data_reader="custom_data_reader",
+            callbacks="callbacks",
         )
         local_results = []
         for step, (x, y) in enumerate(db):

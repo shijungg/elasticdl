@@ -18,6 +18,8 @@ ELASTICDL_REPLICA_TYPE_KEY = "elasticdl-replica-type"
 ELASTICDL_REPLICA_INDEX_KEY = "elasticdl-replica-index"
 _PS_SERVICE_PORT = 2222
 _WORKER_SERVICE_PORT = 3333
+_FTLIB_GOSSIP_CONTAINER_PORT = 7946
+_FTLIB_SSH_CONTAINER_PORT = 22
 
 
 def get_master_pod_name(job_name):
@@ -32,6 +34,20 @@ def get_ps_pod_name(job_name, ps_id):
     return "elasticdl-%s-ps-%s" % (job_name, str(ps_id))
 
 
+def append_pod_ip_to_env(env):
+    pod_ip_var = V1EnvVar(
+        name="MY_POD_IP",
+        value_from=V1EnvVarSource(
+            field_ref=V1ObjectFieldSelector(field_path="status.podIP")
+        ),
+    )
+    if env:
+        env.append(pod_ip_var)
+    else:
+        env = [pod_ip_var]
+    return env
+
+
 class Client(object):
     def __init__(
         self,
@@ -40,7 +56,8 @@ class Client(object):
         namespace,
         job_name,
         event_callback=None,
-        cluster_spec=""
+        cluster_spec="",
+        force_use_kube_config_file=False
     ):
         """
         ElasticDL k8s client.
@@ -53,14 +70,23 @@ class Client(object):
                 Used as pod name prefix and value for "elasticdl" label.
             event_callback: If not None, an event watcher will be created and
                 events passed to the callback.
+            force_use_kube_config_file: If true, force to load the cluster
+                config from ~/.kube/config. Otherwise, if it's in a process
+                running in a K8S environment, it loads the incluster config,
+                if not, it loads the kube config file.
         """
         try:
-            if os.getenv("KUBERNETES_SERVICE_HOST"):
+            if (
+                os.getenv("KUBERNETES_SERVICE_HOST")
+                and not force_use_kube_config_file
+            ):
                 # We are running inside a k8s cluster
                 config.load_incluster_config()
+                logger.info("Load the incluster config.")
             else:
                 # Use user's kube config
                 config.load_kube_config()
+                logger.info("Load the kube config file.")
         except Exception as ex:
             traceback.print_exc()
             raise Exception(
@@ -91,8 +117,8 @@ class Client(object):
                 )
                 for event in stream:
                     self._event_cb(event)
-            except Exception:
-                traceback.print_exc()
+            except Exception as e:
+                logger.debug(e)
             # In case of any flaky issue causing exceptions, we wait for little
             # time and retry.
             time.sleep(5)
@@ -125,12 +151,6 @@ class Client(object):
             self.get_ps_service_name(ps_id), _PS_SERVICE_PORT
         )
 
-    def get_embedding_service_pod_name(self, embedding_service_id):
-        return "elasticdl-%s-embedding-service-%s" % (
-            self.job_name,
-            str(embedding_service_id),
-        )
-
     def patch_labels_to_pod(self, pod_name, labels_dict):
         body = {"metadata": {"labels": labels_dict}}
         try:
@@ -142,42 +162,22 @@ class Client(object):
             return None
 
     def get_master_pod(self):
-        try:
-            return self.client.read_namespaced_pod(
-                name=self.get_master_pod_name(), namespace=self.namespace
-            )
-        except client.api_client.ApiException as e:
-            logger.warning("Exception when reading master pod: %s\n" % e)
-            return None
+        return self.get_pod(self.get_master_pod_name())
 
     def get_worker_pod(self, worker_id):
-        try:
-            return self.client.read_namespaced_pod(
-                name=self.get_worker_pod_name(worker_id),
-                namespace=self.namespace,
-            )
-        except client.api_client.ApiException as e:
-            logger.warning("Exception when reading worker pod: %s\n" % e)
-            return None
+        return self.get_pod(self.get_worker_pod_name(worker_id))
 
     def get_ps_pod(self, ps_id):
-        try:
-            return self.client.read_namespaced_pod(
-                name=self.get_ps_pod_name(ps_id), namespace=self.namespace
-            )
-        except client.api_client.ApiException as e:
-            logger.warning("Exception when reading ps pod: %s\n" % e)
-            return None
+        return self.get_pod(self.get_ps_pod_name(ps_id))
 
-    def get_embedding_service_pod(self, embedding_service_id):
+    def get_pod(self, pod_name):
         try:
             return self.client.read_namespaced_pod(
-                name=self.get_embedding_service_pod_name(embedding_service_id),
-                namespace=self.namespace,
+                namespace=self.namespace, name=pod_name
             )
         except client.api_client.ApiException as e:
             logger.warning(
-                "Exception when reading embedding service pod: %s\n" % e
+                "Exception when reading pod %s: %s\n" % (pod_name, e)
             )
             return None
 
@@ -220,7 +220,7 @@ class Client(object):
         )
         return owner_ref
 
-    def _create_pod(self, **kargs):
+    def create_pod(self, **kargs):
         # Container
         pod_resource_requests = kargs["resource_requests"]
         pod_resource_limits = kargs["resource_limits"]
@@ -228,6 +228,15 @@ class Client(object):
             pod_resource_limits
             if pod_resource_limits
             else pod_resource_requests
+        )
+        ports = (
+            [
+                client.V1ContainerPort(
+                    container_port=_FTLIB_GOSSIP_CONTAINER_PORT, name="gossip"
+                ),
+            ]
+            if "expose_ports" in kargs and kargs["expose_ports"]
+            else None
         )
         container = client.V1Container(
             name=kargs["pod_name"],
@@ -240,6 +249,7 @@ class Client(object):
             args=kargs["container_args"],
             image_pull_policy=kargs["image_pull_policy"],
             env=kargs["env"],
+            ports=ports,
         )
 
         # Pod
@@ -247,6 +257,9 @@ class Client(object):
             containers=[container],
             restart_policy=kargs["restart_policy"],
             priority_class_name=kargs["pod_priority"],
+            termination_grace_period_seconds=kargs.get(
+                "termination_period", None
+            ),
         )
 
         # Mount data path
@@ -282,26 +295,20 @@ class Client(object):
         pod = self._create_master_pod_obj(**kargs)
         pod_dict = self.client.api_client.sanitize_for_serialization(pod)
         with open(kargs["yaml"], "w") as f:
-            yaml.safe_dump(pod_dict, f)
+            yaml.safe_dump(pod_dict, f, default_flow_style=False)
 
     def _create_master_pod_obj(self, **kargs):
-        env = [
-            V1EnvVar(
-                name="MY_POD_IP",
-                value_from=V1EnvVarSource(
-                    field_ref=V1ObjectFieldSelector(field_path="status.podIP")
-                ),
-            )
-        ]
+        env = []
         if "envs" in kargs:
             for key in kargs["envs"]:
                 env.append(V1EnvVar(name=key, value=kargs["envs"][key]))
+        env = append_pod_ip_to_env(env)
 
-        pod = self._create_pod(
+        pod = self.create_pod(
             pod_name=self.get_master_pod_name(),
             job_name=self.job_name,
             image_name=self._image_name,
-            command=["python"],
+            command=["/bin/bash"],
             resource_requests=kargs["resource_requests"],
             resource_limits=kargs["resource_limits"],
             container_args=kargs["args"],
@@ -324,7 +331,8 @@ class Client(object):
         # for the ps or worker pod.
         master_pod = self.get_master_pod()
         env = kargs["envs"] if "envs" in kargs else None
-        pod = self._create_pod(
+        env = append_pod_ip_to_env(env)
+        pod = self.create_pod(
             pod_name=pod_name,
             job_name=self.job_name,
             image_name=self._image_name,
@@ -338,7 +346,9 @@ class Client(object):
             volume=kargs["volume"],
             owner_pod=master_pod,
             ps_addrs=kargs.get("ps_addrs", ""),
+            termination_period=kargs.get("termination_period", None),
             env=env,
+            expose_ports=kargs["expose_ports"],
         )
         # Add replica type and index
         pod.metadata.labels[ELASTICDL_REPLICA_TYPE_KEY] = type_key
@@ -351,12 +361,6 @@ class Client(object):
             pod_name, "worker", kargs["worker_id"], **kargs
         )
 
-    def create_embedding_service(self, **kargs):
-        pod_name = self.get_embedding_service_pod_name(kargs["worker_id"])
-        return self._create_ps_worker_pod(
-            pod_name, "embedding_service", kargs["worker_id"], **kargs
-        )
-
     def create_ps(self, **kargs):
         pod_name = self.get_ps_pod_name(kargs["ps_id"])
         return self._create_ps_worker_pod(
@@ -365,29 +369,17 @@ class Client(object):
 
     def delete_master(self):
         logger.info("pod name is %s" % self.get_master_pod_name())
-        self.client.delete_namespaced_pod(
-            self.get_master_pod_name(),
-            self.namespace,
-            body=client.V1DeleteOptions(grace_period_seconds=0),
-        )
+        self.delete_pod(self.get_master_pod_name())
 
     def delete_worker(self, worker_id):
-        self.client.delete_namespaced_pod(
-            self.get_worker_pod_name(worker_id),
-            self.namespace,
-            body=client.V1DeleteOptions(grace_period_seconds=0),
-        )
-
-    def delete_embedding_service(self, embedding_service_id):
-        self.client.delete_namespaced_pod(
-            self.get_embedding_service_pod_name(embedding_service_id),
-            self.namespace,
-            body=client.V1DeleteOptions(grace_period_seconds=0),
-        )
+        self.delete_pod(self.get_worker_pod_name(worker_id))
 
     def delete_ps(self, ps_id):
+        self.delete_pod(self.get_ps_pod_name(ps_id))
+
+    def delete_pod(self, pod_name):
         self.client.delete_namespaced_pod(
-            self.get_ps_pod_name(ps_id),
+            pod_name,
             self.namespace,
             body=client.V1DeleteOptions(grace_period_seconds=0),
         )
@@ -410,6 +402,19 @@ class Client(object):
             replica_type=replica_type,
             replica_index=replica_index,
             service_type=service_type,
+            owner=self.get_master_pod(),
+        )
+
+    def get_collective_communicator_service_name(self):
+        return self.job_name + "-ftlib-consensus"
+
+    def create_ftlib_consensus_service(self):
+        return self._create_service(
+            name=self.get_collective_communicator_service_name(),
+            port=_FTLIB_GOSSIP_CONTAINER_PORT,
+            target_port=_FTLIB_GOSSIP_CONTAINER_PORT,
+            replica_type="worker",
+            replica_index=None,
             owner=self.get_master_pod(),
         )
 
@@ -448,18 +453,20 @@ class Client(object):
             else None,
             namespace=self.namespace,
         )
+        selector = {
+            "app": ELASTICDL_APP_NAME,
+            ELASTICDL_JOB_KEY: self.job_name,
+            ELASTICDL_REPLICA_TYPE_KEY: kargs["replica_type"],
+        }
+        if kargs["replica_index"] is not None:
+            selector[ELASTICDL_REPLICA_INDEX_KEY] = str(kargs["replica_index"])
         spec = client.V1ServiceSpec(
             ports=[
                 client.V1ServicePort(
                     port=kargs["port"], target_port=kargs["target_port"]
                 )
             ],
-            selector={
-                "app": ELASTICDL_APP_NAME,
-                ELASTICDL_JOB_KEY: self.job_name,
-                ELASTICDL_REPLICA_TYPE_KEY: kargs["replica_type"],
-                ELASTICDL_REPLICA_INDEX_KEY: str(kargs["replica_index"]),
-            },
+            selector=selector,
             type=kargs.get("service_type", None),
         )
         service = client.V1Service(
@@ -474,3 +481,23 @@ class Client(object):
            current job.
         """
         return {"app": ELASTICDL_APP_NAME, ELASTICDL_JOB_KEY: self.job_name}
+
+    def get_master_log(self):
+        return self.get_pod_log(self.get_master_pod_name())
+
+    def get_worker_log(self, worker_id):
+        return self.get_pod_log(self.get_worker_pod_name(worker_id))
+
+    def get_ps_log(self, ps_id):
+        return self.get_pod_log(self.get_ps_pod_name(ps_id))
+
+    def get_pod_log(self, pod_name):
+        try:
+            return self.client.read_namespaced_pod_log(
+                namespace=self.namespace, name=pod_name
+            )
+        except client.api_client.ApiException as e:
+            logger.warning(
+                "Exception when reading log of pod %s: %s\n" % (pod_name, e)
+            )
+            return None

@@ -1,12 +1,21 @@
+import os
+import tempfile
 import unittest
 
 import numpy as np
 import tensorflow as tf
+from tensorflow.python.feature_column import feature_column_v2 as fc_lib
 
 from elasticdl.python.common.constants import DistributionStrategy
 from elasticdl.python.common.model_handler import ModelHandler
+from elasticdl.python.common.save_utils import CheckpointSaver
+from elasticdl.python.elasticdl.feature_column.feature_column import (
+    EmbeddingColumn,
+)
 from elasticdl.python.elasticdl.layers.embedding import Embedding
-from elasticdl.python.keras.layers import SparseEmbedding
+from elasticdl.python.ps.embedding_table import EmbeddingTable
+from elasticdl.python.ps.parameters import Parameters
+from elasticdl_preprocessing.layers import SparseEmbedding
 
 EMBEDDING_INPUT_DIM = 300000
 
@@ -23,11 +32,33 @@ class CustomModel(tf.keras.models.Model):
         return output
 
 
-def custom_model_with_embedding():
+def custom_model_with_embedding_layer():
     inputs = tf.keras.layers.Input(shape=(4,), name="x")
     embedding = tf.keras.layers.Embedding(EMBEDDING_INPUT_DIM, 2)(inputs)
     outputs = tf.keras.layers.Dense(1)(embedding)
     return tf.keras.models.Model(inputs, outputs)
+
+
+def custom_model_with_embedding_column():
+    inputs = {
+        "age": tf.keras.layers.Input(shape=(1,), name="age", dtype=tf.float32),
+        "user_id": tf.keras.layers.Input(
+            shape=(1,), name="user_id", dtype=tf.string
+        ),
+    }
+    age = tf.feature_column.numeric_column("age", dtype=tf.int64)
+    user_id_embedding = tf.feature_column.embedding_column(
+        tf.feature_column.categorical_column_with_hash_bucket(
+            "user_id", hash_bucket_size=EMBEDDING_INPUT_DIM
+        ),
+        dimension=2,
+    )
+    feature_columns = [age, user_id_embedding]
+    dense = tf.keras.layers.DenseFeatures(feature_columns=feature_columns)(
+        inputs
+    )
+    output = tf.keras.layers.Dense(1)(dense)
+    return tf.keras.models.Model(inputs, output)
 
 
 def custom_model_with_sparse_embedding():
@@ -92,7 +123,7 @@ class DefaultModelHandlerTest(unittest.TestCase):
         self.model_handler = ModelHandler.get_model_handler()
 
     def test_get_model_to_ps(self):
-        model_inst = custom_model_with_embedding()
+        model_inst = custom_model_with_embedding_layer()
         model_inst = self.model_handler.get_model_to_train(model_inst)
         self.assertEqual(type(model_inst.layers[1]), tf.keras.layers.Embedding)
 
@@ -130,50 +161,126 @@ class ParameterSeverModelHandlerTest(unittest.TestCase):
         tf.keras.backend.clear_session()
         self.model_handler = ModelHandler.get_model_handler(
             distribution_strategy=DistributionStrategy.PARAMETER_SERVER,
-            checkpoint_dir="elasticdl/python/tests/testdata/functional_ckpt/",
+            checkpoint_dir="",
         )
 
-    def test_get_model_to_train(self):
-        model_inst = custom_model_with_embedding()
+    def _mock_model_parameters(self, model):
+        params = Parameters()
+        for weight in model.trainable_variables:
+            if "embedding" in weight.name:
+                embedding_table = EmbeddingTable(
+                    name=weight.name,
+                    dim=weight.shape[1],
+                    initializer="RandomUniform",
+                )
+                embedding_table.set(
+                    np.arange(weight.shape[0]), np.ones(weight.shape)
+                )
+                params.embedding_params[weight.name] = embedding_table
+            else:
+                params.non_embedding_params[weight.name] = tf.ones(
+                    weight.shape
+                )
+        params.version = 100
+        return params
+
+    def _mock_model_weights_and_save_checkpoint(self, model):
+        ckpt_dir = self.model_handler._checkpoint_dir
+        checkpoint_saver = CheckpointSaver(ckpt_dir, 0, 0, False)
+        params = self._mock_model_parameters(model)
+        model_pb = params.to_model_pb()
+        checkpoint_saver.save(100, model_pb, False)
+
+    def test_get_model_with_embedding_layer_to_train(self):
+        model_inst = custom_model_with_embedding_layer()
         model_inst = self.model_handler.get_model_to_train(model_inst)
         self.assertEqual(type(model_inst.layers[1]), Embedding)
 
-    def test_get_model_to_export(self):
-        model_inst = custom_model_with_embedding()
-        train_model = self.model_handler.get_model_to_train(model_inst)
-        export_model = self.model_handler.get_model_to_export(
-            train_model, dataset=None
+    def test_get_model_with_embedding_column_to_train(self):
+        model_inst = custom_model_with_embedding_column()
+        dense_features_layer_index = 2
+        embedding_column_index = 1
+        self.assertEqual(
+            type(
+                model_inst.layers[dense_features_layer_index]._feature_columns[
+                    embedding_column_index
+                ]
+            ),
+            fc_lib.EmbeddingColumn,
+        )
+        model_inst = self.model_handler.get_model_to_train(model_inst)
+        self.assertEqual(
+            type(
+                model_inst.layers[dense_features_layer_index]._feature_columns[
+                    embedding_column_index
+                ]
+            ),
+            EmbeddingColumn,
         )
 
-        test_data = tf.constant([0])
-        result = export_model.call(test_data).numpy()
-        self.assertEqual(result[0][0], 3.0)
+    def test_get_model_with_embedding_column_to_export(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.model_handler._checkpoint_dir = os.path.join(
+                temp_dir, "test_export"
+            )
+            model_inst = custom_model_with_embedding_column()
+            self._mock_model_weights_and_save_checkpoint(model_inst)
+
+            model_inst = self.model_handler.get_model_to_train(model_inst)
+            export_model = self.model_handler.get_model_to_export(
+                model_inst, dataset=None
+            )
+            result = export_model.call(
+                {"age": tf.constant([[1]]), "user_id": tf.constant([["134"]])}
+            ).numpy()
+            self.assertEqual(result[0][0], 4.0)
+
+    def test_get_model_to_export(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.model_handler._checkpoint_dir = os.path.join(
+                temp_dir, "test_export"
+            )
+            model_inst = custom_model_with_embedding_layer()
+            train_model = self.model_handler.get_model_to_train(model_inst)
+
+            self._mock_model_weights_and_save_checkpoint(model_inst)
+            export_model = self.model_handler.get_model_to_export(
+                train_model, dataset=None
+            )
+
+            test_data = tf.constant([0])
+            result = export_model.call(test_data).numpy()
+            self.assertEqual(result[0][0], 3.0)
 
     def test_get_subclass_model_to_export(self):
-        self.model_handler._checkpoint_dir = (
-            "elasticdl/python/tests/testdata/subclass_ckpt/"
-        )
-
-        def _get_dataset():
-            dataset = tf.data.Dataset.from_tensor_slices(
-                np.random.randint(0, 10, (10, 4))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.model_handler._checkpoint_dir = os.path.join(
+                temp_dir, "test_export"
             )
-            dataset = dataset.batch(2)
-            return dataset
 
-        model_inst = CustomModel()
-        dataset = _get_dataset()
+            def _get_dataset():
+                dataset = tf.data.Dataset.from_tensor_slices(
+                    np.random.randint(0, 10, (10, 4))
+                )
+                dataset = dataset.batch(2)
+                return dataset
 
-        train_model = self.model_handler.get_model_to_train(model_inst)
-        self.assertEqual(type(train_model.embedding), Embedding)
+            model_inst = CustomModel()
+            dataset = _get_dataset()
+            model_inst._build_model_with_inputs(inputs=dataset, targets=None)
+            self._mock_model_weights_and_save_checkpoint(model_inst)
 
-        export_model = self.model_handler.get_model_to_export(
-            train_model, dataset=dataset
-        )
+            model_inst.inputs = None  # Reset model inputs
+            train_model = self.model_handler.get_model_to_train(model_inst)
+            self.assertEqual(type(train_model.embedding), Embedding)
 
-        test_data = tf.constant([0])
-        result = export_model.call(test_data).numpy()
-        self.assertEqual(result[0][0], 3.0)
+            export_model = self.model_handler.get_model_to_export(
+                train_model, dataset=dataset
+            )
+
+            test_data = tf.constant([0])
+            result = export_model.call(test_data).numpy()
+            self.assertEqual(result[0][0], 3.0)
 
     def test_get_model_with_sparse_to_train(self):
         model_inst = custom_model_with_sparse_embedding()
@@ -181,23 +288,29 @@ class ParameterSeverModelHandlerTest(unittest.TestCase):
         self.assertEqual(type(model_inst.layers[1]), Embedding)
 
     def test_get_model_with_sparse_to_export(self):
-        model_inst = custom_model_with_sparse_embedding()
-        train_model = self.model_handler.get_model_to_train(model_inst)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.model_handler._checkpoint_dir = os.path.join(
+                temp_dir, "test_export"
+            )
+            model_inst = custom_model_with_sparse_embedding()
+            train_model = self.model_handler.get_model_to_train(model_inst)
 
-        # Model handler will restore model parameters from the checkpoint
-        # directory and assign parameters to train_model.
-        export_model = self.model_handler.get_model_to_export(
-            train_model, dataset=None
-        )
-        test_data = tf.SparseTensor(
-            indices=[[0, 0]], values=[0], dense_shape=(1, 1)
-        )
-        result = export_model.call(test_data).numpy()
+            self._mock_model_weights_and_save_checkpoint(model_inst)
+            # Model handler will restore model parameters from the checkpoint
+            # directory and assign parameters to train_model.
+            export_model = self.model_handler.get_model_to_export(
+                train_model, dataset=None
+            )
+            test_data = tf.SparseTensor(
+                indices=[[0, 0]], values=[0], dense_shape=(1, 1)
+            )
+            result = export_model.call(test_data).numpy()
 
-        # The embedding table in checkpoint file is
-        # [[1.0, 1.0], [1.0, 1.0], [1.0,1.0], [1.0, 1.0]], weights in the dense
-        # layer is [[1.0],[1].0], bias is [1.0]. So the result is 3.0.
-        self.assertEqual(result[0][0], 3.0)
+            # The embedding table in checkpoint file is
+            # [[1.0, 1.0], [1.0, 1.0], [1.0,1.0], [1.0, 1.0]], weights in the
+            # dense layer is [[1.0],[1.0]], bias is [1.0]. So the result
+            # is 3.0.
+            self.assertEqual(result[0][0], 3.0)
 
 
 if __name__ == "__main__":

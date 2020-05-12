@@ -1,30 +1,38 @@
 import os
+import threading
 import time
 from concurrent import futures
 
 import grpc
 from kubernetes.client import V1EnvVar
 
-from elasticdl.proto import elasticdl_pb2_grpc
+from elasticdl.proto import elasticdl_pb2, elasticdl_pb2_grpc
 from elasticdl.python.common.args import (
     build_arguments_from_parsed_result,
     parse_envs,
+    wrap_go_args_with_string,
+    wrap_python_args_with_string,
 )
 from elasticdl.python.common.constants import (
     GRPC,
+    DistributionStrategy,
     InstanceManagerStatus,
     JobType,
 )
 from elasticdl.python.common.k8s_tensorboard_client import TensorBoardClient
 from elasticdl.python.common.log_utils import get_logger
-from elasticdl.python.common.model_handler import ModelHandler
 from elasticdl.python.common.model_utils import (
     get_dict_from_params_str,
     get_module_file_path,
+    get_optimizer_info,
+    load_callbacks_from_module,
     load_model_from_module,
     load_module,
+    set_callback_parameters,
 )
+from elasticdl.python.common.save_utils import CheckpointSaver
 from elasticdl.python.data.reader.data_reader_factory import create_data_reader
+from elasticdl.python.elasticdl.callbacks import MaxStepsStopping
 from elasticdl.python.master.evaluation_service import EvaluationService
 from elasticdl.python.master.k8s_instance_manager import InstanceManager
 from elasticdl.python.master.servicer import MasterServicer
@@ -40,6 +48,7 @@ def _make_task_dispatcher(
     num_epochs,
     data_reader_params,
     create_data_reader_fn,
+    callbacks_list,
 ):
     def _maybe_create_shards(data_origin):
         kwargs = get_dict_from_params_str(data_reader_params)
@@ -63,6 +72,7 @@ def _make_task_dispatcher(
         records_per_task,
         # Only generate prediction tasks for 1 epoch
         1 if prediction_f_records else num_epochs,
+        callbacks_list,
     )
 
 
@@ -72,6 +82,7 @@ class Master(object):
 
         self.num_ps_pods = args.num_ps_pods
         self.checkpoint_output_path = args.checkpoint_dir
+        self.distribution_strategy = args.distribution_strategy
 
         # Master addr
         master_ip = os.getenv("MY_POD_IP", "localhost")
@@ -96,16 +107,25 @@ class Master(object):
         self.model_inst = load_model_from_module(
             args.model_def, self.model_module, args.model_params
         )
-        model_handler = ModelHandler.get_model_handler(
-            args.distribution_strategy, checkpoint_dir=args.checkpoint_dir
-        )
-        self.model_inst = model_handler.get_model_to_train(self.model_inst)
         self.optimizer = self.model_module[args.optimizer]()
         self._create_data_reader_fn = create_data_reader
         if args.custom_data_reader in self.model_module:
             self._create_data_reader_fn = self.model_module[
                 args.custom_data_reader
             ]
+
+        # Initialize the callbacks
+        self.callbacks_list = load_callbacks_from_module(
+            args.callbacks, self.model_module
+        )
+        self.callbacks_list.set_model(self.model_inst)
+        set_callback_parameters(
+            self.callbacks_list,
+            batch_size=args.minibatch_size,
+            saved_model_path=args.output,
+            checkpoint_path=args.checkpoint_dir,
+        )
+        self._set_completed_steps_by_checkpoint(args.checkpoint_dir_for_init)
 
         # Start task queue
         records_per_task = args.minibatch_size * args.num_minibatches_per_task
@@ -117,17 +137,10 @@ class Master(object):
             args.num_epochs,
             args.data_reader_params,
             self._create_data_reader_fn,
+            self.callbacks_list,
         )
 
-        saved_model_path = args.output
-        if saved_model_path is not None and self.job_type in [
-            JobType.TRAINING_ONLY,
-            JobType.TRAINING_WITH_EVALUATION,
-        ]:
-            self.task_d.add_deferred_callback_create_save_model_task(
-                saved_model_path
-            )
-
+        self.task_d.add_deferred_callback_create_train_end_task()
         self.evaluation_service = self._create_evaluation_service(args)
 
         # Initialize master service
@@ -138,6 +151,29 @@ class Master(object):
 
         self._should_stop = False
         self._exit_code = 0
+        threading.Thread(
+            target=self._check_timeout_tasks,
+            name="check_timeout_tasks",
+            daemon=True,
+        ).start()
+
+    def _set_completed_steps_by_checkpoint(self, checkpoint_dir_for_init):
+        if not checkpoint_dir_for_init:
+            return
+
+        if not CheckpointSaver.check_checkpoint_valid(checkpoint_dir_for_init):
+            raise ValueError(
+                "Invalid checkpoint directory {}".format(
+                    checkpoint_dir_for_init
+                )
+            )
+
+        model_verion = CheckpointSaver.get_version_from_checkpoint(
+            checkpoint_dir_for_init
+        )
+        for callback in self.callbacks_list.callbacks:
+            if isinstance(callback, MaxStepsStopping):
+                callback.set_completed_steps(model_verion)
 
     def request_stop(self, err_msg=None):
         """Request master to quit"""
@@ -165,7 +201,11 @@ class Master(object):
         # Start the worker manager if requested
         if self.instance_manager:
             self.instance_manager.update_status(InstanceManagerStatus.PENDING)
-            self.instance_manager.start_parameter_servers()
+            if self.distribution_strategy == DistributionStrategy.ALLREDUCE:
+                # Exposes the consensus service for allreduce-based training
+                self.instance_manager.start_ftlib_consensus_service()
+            else:
+                self.instance_manager.start_parameter_servers()
             self.instance_manager.start_workers()
             self.instance_manager.update_status(InstanceManagerStatus.RUNNING)
 
@@ -183,6 +223,11 @@ class Master(object):
         """
         try:
             while True:
+                if self.instance_manager.all_workers_failed:
+                    raise Exception(
+                        "All workers fail with unrecoverable errors"
+                    )
+                    break
                 if self.task_d.finished():
                     if self.instance_manager:
                         self.instance_manager.update_status(
@@ -325,74 +370,113 @@ class Master(object):
 
     def _create_instance_manager(self, args):
         instance_manager = None
+
+        container_command = ["/bin/bash"]
         if args.num_workers:
             assert args.worker_image, "Worker image cannot be empty"
 
-            worker_command = ["python"]
+            worker_client_command = "python -m elasticdl.python.worker.main"
             worker_args = [
-                "-m",
-                "elasticdl.python.worker.main",
                 "--master_addr",
                 self.master_addr,
                 "--job_type",
                 self.job_type,
             ]
             worker_args.extend(build_arguments_from_parsed_result(args))
+            worker_args = wrap_python_args_with_string(worker_args)
+            worker_args.insert(0, worker_client_command)
 
-            ps_command = ["python"]
-            ps_args = [
-                "-m",
-                "elasticdl.python.ps.main",
-                "--grads_to_wait",
-                str(args.grads_to_wait),
-                "--lr_staleness_modulation",
-                str(args.lr_staleness_modulation),
-                "--use_async",
-                str(args.use_async),
-                "--minibatch_size",
-                str(args.minibatch_size),
-                "--model_zoo",
-                args.model_zoo,
-                "--model_def",
-                args.model_def,
-                "--job_name",
-                args.job_name,
-                "--num_minibatches_per_task",
-                str(args.num_minibatches_per_task),
-                "--port",
-                "2222",
-                "--master_addr",
-                self.master_addr,
-                "--namespace",
-                args.namespace,
-                "--evaluation_steps",
-                str(args.evaluation_steps),
-                "--checkpoint_dir",
-                str(args.checkpoint_dir),
-                "--checkpoint_steps",
-                str(args.checkpoint_steps),
-                "--keep_checkpoint_max",
-                str(args.keep_checkpoint_max),
-                "--num_ps_pods",
-                str(args.num_ps_pods),
-                "--checkpoint_dir_for_init",
-                str(args.checkpoint_dir_for_init),
-                "--num_workers",
-                str(args.num_workers),
-                "--log_level",
-                str(args.log_level),
-            ]
+            if args.use_go_ps:
+                opt_type, opt_args = get_optimizer_info(self.optimizer)
+                # TODO: rename the Go PS executable using a meaningful filename
+                ps_client_command = "main"
+                ps_args = [
+                    "-job_name=" + args.job_name,
+                    "-namespace=" + args.namespace,
+                    "-master_addr=" + self.master_addr,
+                    "-port=2222",
+                    "-use_async=" + ("true" if args.use_async else "false"),
+                    "-grads_to_wait=" + str(args.grads_to_wait),
+                    "-lr_staleness_modulation="
+                    + ("true" if args.lr_staleness_modulation else "false"),
+                    "-sync_version_tolerance="
+                    + str(args.sync_version_tolerance),
+                    "-evaluation_steps=" + str(args.evaluation_steps),
+                    "-num_ps_pods=" + str(args.num_ps_pods),
+                    "-num_workers=" + str(args.num_workers),
+                    "-checkpoint_dir=" + str(args.checkpoint_dir),
+                    "-checkpoint_steps=" + str(args.checkpoint_steps),
+                    "-keep_checkpoint_max=" + str(args.keep_checkpoint_max),
+                    "-checkpoint_dir_for_init="
+                    + str(args.checkpoint_dir_for_init),
+                    "-opt_type=" + opt_type,
+                    "-opt_args=" + opt_args,
+                ]
+                ps_args = wrap_go_args_with_string(ps_args)
+                ps_args.insert(0, ps_client_command)
+            else:
+                ps_client_command = "python -m elasticdl.python.ps.main"
+                ps_args = [
+                    "--grads_to_wait",
+                    str(args.grads_to_wait),
+                    "--lr_staleness_modulation",
+                    str(args.lr_staleness_modulation),
+                    "--sync_version_tolerance",
+                    str(args.sync_version_tolerance),
+                    "--use_async",
+                    str(args.use_async),
+                    "--model_zoo",
+                    args.model_zoo,
+                    "--model_def",
+                    args.model_def,
+                    "--job_name",
+                    args.job_name,
+                    "--port",
+                    "2222",
+                    "--master_addr",
+                    self.master_addr,
+                    "--namespace",
+                    args.namespace,
+                    "--evaluation_steps",
+                    str(args.evaluation_steps),
+                    "--checkpoint_dir",
+                    str(args.checkpoint_dir),
+                    "--checkpoint_steps",
+                    str(args.checkpoint_steps),
+                    "--keep_checkpoint_max",
+                    str(args.keep_checkpoint_max),
+                    "--num_ps_pods",
+                    str(args.num_ps_pods),
+                    "--checkpoint_dir_for_init",
+                    str(args.checkpoint_dir_for_init),
+                    "--num_workers",
+                    str(args.num_workers),
+                    "--log_level",
+                    str(args.log_level),
+                    "--minibatch_size",
+                    str(args.minibatch_size),
+                    "--num_minibatches_per_task",
+                    str(args.num_minibatches_per_task),
+                ]
+                ps_args = wrap_python_args_with_string(ps_args)
+                ps_args.insert(0, ps_client_command)
+
+            worker_args = ["-c", " ".join(worker_args)]
+            ps_args = ["-c", " ".join(ps_args)]
 
             env_dict = parse_envs(args.envs)
             env = []
             for key in env_dict:
                 env.append(V1EnvVar(name=key, value=env_dict[key]))
 
+            kwargs = get_dict_from_params_str(args.aux_params)
+            disable_relaunch = kwargs.get("disable_relaunch", False)
+
             instance_manager = InstanceManager(
                 self.task_d,
                 job_name=args.job_name,
                 image_name=args.worker_image,
-                worker_command=worker_command,
+                worker_command=container_command,
                 worker_args=worker_args,
                 namespace=args.namespace,
                 num_workers=args.num_workers,
@@ -400,7 +484,7 @@ class Master(object):
                 worker_resource_limit=args.worker_resource_limit,
                 worker_pod_priority=args.worker_pod_priority,
                 num_ps=args.num_ps_pods,
-                ps_command=ps_command,
+                ps_command=container_command,
                 ps_args=ps_args,
                 ps_resource_request=args.ps_resource_request,
                 ps_resource_limit=args.ps_resource_limit,
@@ -410,6 +494,34 @@ class Master(object):
                 restart_policy=args.restart_policy,
                 cluster_spec=args.cluster_spec,
                 envs=env,
+                expose_ports=self.distribution_strategy
+                == DistributionStrategy.ALLREDUCE,
+                disable_relaunch=disable_relaunch,
+                log_file_path=args.log_file_path,
             )
 
         return instance_manager
+
+    def _check_timeout_tasks(self):
+        while True:
+            doing_tasks = self.task_d._doing.copy()
+            cur_time = time.time()
+            avg_time = self.master_servicer.get_average_task_complete_time()
+            for task_id, (worker_id, task, start_time) in doing_tasks.items():
+                if task.type == elasticdl_pb2.TRAINING:
+                    start_time = self.master_servicer.get_worker_liveness_time(
+                        worker_id
+                    )
+                if task.type in [
+                    elasticdl_pb2.TRAINING,
+                    elasticdl_pb2.EVALUATION,
+                ]:
+                    if (cur_time - start_time) > 3 * avg_time[task.type]:
+                        self.logger.info(
+                            "worker %d timeout, relaunch it" % worker_id
+                        )
+                        self.task_d.recover_tasks(worker_id)
+                        # TODO: save worker logs before remove it
+                        self.instance_manager._remove_worker(worker_id)
+                        break
+            time.sleep(30)

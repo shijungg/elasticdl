@@ -95,6 +95,7 @@ class EmbeddingColumn(
     ),
 ):
     def __init__(self, **kwargs):
+        # Get the input dimension of the embedding variable
         default_num_buckets = (
             self.categorical_column.num_buckets
             if self._is_v2_column
@@ -105,7 +106,7 @@ class EmbeddingColumn(
         )
 
         self._embedding_delegate = EmbeddingDelegate(
-            input_dim=num_buckets, output_dim=self.dimension, name=self.name
+            input_dim=num_buckets, output_dim=self.dimension,
         )
 
     @property
@@ -129,6 +130,10 @@ class EmbeddingColumn(
     def variable_shape(self):
         """See `DenseColumn` base class."""
         return tensor_shape.TensorShape([self.dimension])
+
+    def create_state(self, state_manager):
+        dense_features_layer_name = state_manager._layer.name
+        self.set_dense_features_layer_name(dense_features_layer_name)
 
     def get_dense_tensor(self, transformation_cache, state_manager):
         if isinstance(
@@ -179,9 +184,25 @@ class EmbeddingColumn(
         """
         self._embedding_delegate.set_lookup_embedding_func(func)
 
+    def set_dense_features_layer_name(self, dense_features_layer_name):
+        # Get the name of the embedding variable
+        EMBEDDING_VARIABLE_NAME_FORMAT = (
+            "{dense_features_layer_name}/{column_name}/embedding_weights:0"
+        )
+        embedding_variable_name = EMBEDDING_VARIABLE_NAME_FORMAT.format(
+            dense_features_layer_name=dense_features_layer_name,
+            column_name=self.name,
+        )
+
+        self._embedding_delegate.set_name(embedding_variable_name)
+
     def reset(self):
         self._embedding_delegate.reset()
 
     @property
     def embedding_and_ids(self):
         return self._embedding_delegate.embedding_and_ids
+
+    @property
+    def embedding_weight_name(self):
+        return self._embedding_delegate.name

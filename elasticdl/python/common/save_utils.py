@@ -1,12 +1,16 @@
 import contextlib
 import os
+import shutil
 import tempfile
 
 import tensorflow as tf
 
 from elasticdl.proto import elasticdl_pb2
 from elasticdl.python.common.hash_utils import int_to_id, string_to_id
-from elasticdl.python.common.tensor import Tensor
+from elasticdl.python.common.tensor_utils import (
+    pb_to_indexed_slices,
+    pb_to_ndarray,
+)
 from elasticdl.python.ps.embedding_table import create_embedding_table
 from elasticdl.python.ps.parameters import Parameters
 
@@ -28,12 +32,10 @@ def load_pb_from_file(pb_obj, file_name):
 def _get_params_shard_from_pb(model_pb, shard_index, shard_num):
     """Get parameters including variables values and embedding table
     from a model protobuf.
-
     Args:
         model_pb: A Model protobuf instance.
         shard_index: Model shard index.
         shard_num: The total number of model shards.
-
     Return:
         non_embedding_vars: A Python dict in which the key is a variable
             name and the value is a `tf.Variable` object.
@@ -44,19 +46,18 @@ def _get_params_shard_from_pb(model_pb, shard_index, shard_num):
     non_embedding_vars = {}
     embedding_table_values = {}
 
-    for tensor_pb in model_pb.param:
-        tensor = Tensor.from_tensor_pb(tensor_pb)
-        if tensor.indices is not None:
-            embedding_table_values.setdefault(tensor.name, ([], []))
-            for embedding_id, vector in zip(tensor.indices, tensor.values):
-                if int_to_id(embedding_id, shard_num) == shard_index:
-                    embedding_table_values[tensor.name][0].append(embedding_id)
-                    embedding_table_values[tensor.name][1].append(vector)
-        else:
-            if string_to_id(tensor.name, shard_num) == shard_index:
-                non_embedding_vars[tensor.name] = tf.Variable(
-                    initial_value=tensor.values, trainable=True
-                )
+    for name, pb in model_pb.dense_parameters.items():
+        if string_to_id(name, shard_num) == shard_index:
+            non_embedding_vars[name] = tf.Variable(
+                initial_value=pb_to_ndarray(pb), trainable=True
+            )
+    for name, pb in model_pb.embedding_tables.items():
+        embedding_table_values.setdefault(name, ([], []))
+        t = pb_to_indexed_slices(pb)
+        for embedding_id, vector in zip(t.indices, t.values):
+            if int_to_id(embedding_id, shard_num) == shard_index:
+                embedding_table_values[name][0].append(embedding_id)
+                embedding_table_values[name][1].append(vector)
     return non_embedding_vars, embedding_table_values
 
 
@@ -91,7 +92,7 @@ class CheckpointSaver(object):
             self._directory = os.getcwd() + "/checkpoint_dir"
         if self._steps:
             os.makedirs(self._directory, exist_ok=True)
-        self._checkpoint_list = []
+        self._checkpoint_dir_list = []
         self._include_evaluation = include_evaluation
         self._eval_checkpoint_dir = (
             tempfile.mkdtemp() if include_evaluation else ""
@@ -108,7 +109,8 @@ class CheckpointSaver(object):
         checkpoint_version_dir = os.path.join(
             checkpoint_dir, "version-%s" % str(version)
         )
-        os.makedirs(checkpoint_version_dir, exist_ok=True)
+        with contextlib.suppress(FileExistsError):
+            os.makedirs(checkpoint_version_dir, exist_ok=True)
         return "%s/variables-%s-of-%s.ckpt" % (
             checkpoint_version_dir,
             str(shard_index),
@@ -140,12 +142,12 @@ class CheckpointSaver(object):
                 e.g. shard_number is the number of PS instances using
                 ParameterServerStrategy.
         """
-        file = self._get_checkpoint_file(
+        filename = self._get_checkpoint_file(
             version, is_eval_checkpoint, shard_index, shard_num
         )
-        save_pb_to_file(model, file)
+        save_pb_to_file(model, filename)
         if not is_eval_checkpoint:
-            self._checkpoint_list.append(Checkpoint(version, file))
+            self._checkpoint_dir_list.append(os.path.dirname(filename))
             if self._max_versions:
                 self._delete_old_checkpoints_if_needed()
 
@@ -153,20 +155,16 @@ class CheckpointSaver(object):
         """Delete the oldest checkpoint files and keep the number of
         checkpoints is not beyond max_version.
         """
-        while len(self._checkpoint_list) > self._max_versions:
-            checkpoint_file = self._checkpoint_list.pop(0).file
-            checkpoint_version_dir = os.path.dirname(checkpoint_file)
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(checkpoint_file)
-                # Remove the directory if empty
-                if not os.listdir(checkpoint_version_dir):
-                    os.rmdir(checkpoint_version_dir)
+        if len(self._checkpoint_dir_list) > self._max_versions:
+            old_version_dir = self._checkpoint_dir_list[0]
 
-    def get_latest_checkpoint_version(self):
-        """Get the latest checkpointed model version"""
-        if not self._checkpoint_list:
-            raise RuntimeError("No model checkpoint available")
-        return self._checkpoint_list[-1].version
+            # Some PS instances have not saved checkpoint shard files of
+            # the version if invalid. And the slowest PS will remove the
+            # old version checkpoint.
+            if self.check_checkpoint_valid(old_version_dir):
+                self._checkpoint_dir_list.pop(0)
+                with contextlib.suppress(FileNotFoundError):
+                    shutil.rmtree(old_version_dir)
 
     @staticmethod
     def get_valid_lastest_version_dir(checkpoint_dir):
@@ -236,10 +234,10 @@ class CheckpointSaver(object):
                 version = model_pb.version
             elif version != model_pb.version:
                 raise ValueError(
-                    "The versions in model shards are not consistency"
+                    "The versions in model shards are not consistent"
                 )
 
-            for embedding_info_pb in model_pb.embedding_table_info:
+            for embedding_info_pb in model_pb.embedding_table_infos:
                 embedding_table = create_embedding_table(embedding_info_pb)
                 embedding_tables.setdefault(
                     embedding_table.name, embedding_table
@@ -259,3 +257,15 @@ class CheckpointSaver(object):
         parameters.embedding_params.update(embedding_tables)
         parameters.version = version
         return parameters
+
+    @staticmethod
+    def get_version_from_checkpoint(checkpoint_dir):
+        """Get model version from the checkpoint. There may be several shard
+        files in the checkpoint directory. The model versions of shard files
+        are same, so we only need to read one shard file to get model version.
+        """
+        variable_shard_files = os.listdir(checkpoint_dir)
+        shard_file_path = os.path.join(checkpoint_dir, variable_shard_files[0])
+        model_pb = elasticdl_pb2.Model()
+        model_pb = load_pb_from_file(model_pb, shard_file_path)
+        return model_pb.version

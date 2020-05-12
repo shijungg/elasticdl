@@ -1,6 +1,5 @@
 import numpy as np
-
-from elasticdl.proto import tensor_dtype_pb2
+from tensorflow.core.framework import types_pb2
 
 
 def dtype_tensor_to_numpy(dtype):
@@ -13,7 +12,7 @@ def dtype_tensor_to_numpy(dtype):
 
 def dtype_numpy_to_tensor(dtype):
     """Convert numpy dtype object to tensor dtype."""
-    return _DT_NP_TO_TENSOR.get(dtype.type, tensor_dtype_pb2.DT_INVALID)
+    return _DT_NP_TO_TENSOR.get(dtype.type, types_pb2.DT_INVALID)
 
 
 def is_numpy_dtype_allowed(dtype):
@@ -21,23 +20,21 @@ def is_numpy_dtype_allowed(dtype):
 
 
 _DT_TENSOR_TO_NP = {
-    tensor_dtype_pb2.DT_INT8: np.int8,
-    tensor_dtype_pb2.DT_INT16: np.int16,
-    tensor_dtype_pb2.DT_INT32: np.int32,
-    tensor_dtype_pb2.DT_INT64: np.int64,
-    tensor_dtype_pb2.DT_FLOAT16: np.float16,
-    tensor_dtype_pb2.DT_FLOAT32: np.float32,
-    tensor_dtype_pb2.DT_FLOAT64: np.float64,
-    tensor_dtype_pb2.DT_BOOL: np.bool,
+    types_pb2.DT_INT8: np.int8,
+    types_pb2.DT_INT16: np.int16,
+    types_pb2.DT_INT32: np.int32,
+    types_pb2.DT_INT64: np.int64,
+    types_pb2.DT_FLOAT: np.float32,
+    types_pb2.DT_DOUBLE: np.float64,
+    types_pb2.DT_BOOL: np.bool,
 }
 
 _DT_NP_TO_TENSOR = {
-    np.int8: tensor_dtype_pb2.DT_INT8,
-    np.int16: tensor_dtype_pb2.DT_INT16,
-    np.int32: tensor_dtype_pb2.DT_INT32,
-    np.int64: tensor_dtype_pb2.DT_INT64,
-    np.float16: tensor_dtype_pb2.DT_FLOAT16,
-    np.float32: tensor_dtype_pb2.DT_FLOAT32,
-    np.float64: tensor_dtype_pb2.DT_FLOAT64,
-    np.bool: tensor_dtype_pb2.DT_BOOL,
+    np.int8: types_pb2.DT_INT8,
+    np.int16: types_pb2.DT_INT16,
+    np.int32: types_pb2.DT_INT32,
+    np.int64: types_pb2.DT_INT64,
+    np.float32: types_pb2.DT_FLOAT,
+    np.float64: types_pb2.DT_DOUBLE,
+    np.bool: types_pb2.DT_BOOL,
 }

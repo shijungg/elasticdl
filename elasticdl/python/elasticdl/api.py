@@ -4,8 +4,12 @@ from elasticdl.python.common import k8s_client as k8s
 from elasticdl.python.common.args import (
     build_arguments_from_parsed_result,
     parse_envs,
+    wrap_python_args_with_string,
 )
-from elasticdl.python.common.constants import DistributionStrategy
+from elasticdl.python.common.constants import (
+    BashCommandTemplate,
+    DistributionStrategy,
+)
 from elasticdl.python.common.log_utils import default_logger as logger
 from elasticdl.python.elasticdl.image_builder import (
     build_and_push_docker_image,
@@ -20,8 +24,14 @@ def train(args):
     if args.distribution_strategy == DistributionStrategy.LOCAL:
         local_executor = LocalExecutor(args)
         local_executor.run()
-    else:
-        image_name = build_and_push_docker_image(
+        return
+
+    image_pre_built = bool(args.image_name)
+
+    image_name = (
+        args.image_name
+        if image_pre_built
+        else build_and_push_docker_image(
             model_zoo=model_zoo,
             base_image=args.image_base,
             docker_image_repository=args.docker_image_repository,
@@ -31,53 +41,70 @@ def train(args):
             docker_tlscert=args.docker_tlscert,
             docker_tlskey=args.docker_tlskey,
         )
-
-        container_args = [
-            "-m",
-            "elasticdl.python.master.main",
-            "--worker_image",
-            image_name,
-            "--model_zoo",
-            _model_zoo_in_docker(model_zoo),
-            "--cluster_spec",
-            _cluster_spec_def_in_docker(args.cluster_spec),
-        ]
-        container_args.extend(
-            build_arguments_from_parsed_result(
-                args, filter_args=["model_zoo", "cluster_spec", "worker_image"]
-            )
-        )
-
-        _submit_job(image_name, args, container_args)
-        # TODO: print dashboard url after launching the master pod
-
-
-def evaluate(args):
-    model_zoo = os.path.normpath(args.model_zoo)
-
-    image_name = build_and_push_docker_image(
-        model_zoo=model_zoo,
-        base_image=args.image_base,
-        docker_image_repository=args.docker_image_repository,
-        extra_pypi=args.extra_pypi_index,
-        cluster_spec=args.cluster_spec,
-        docker_base_url=args.docker_base_url,
-        docker_tlscert=args.docker_tlscert,
-        docker_tlskey=args.docker_tlskey,
     )
+
     container_args = [
-        "-m",
-        "elasticdl.python.master.main",
         "--worker_image",
         image_name,
         "--model_zoo",
-        _model_zoo_in_docker(model_zoo),
+        _model_zoo_in_docker(model_zoo, image_pre_built),
         "--cluster_spec",
         _cluster_spec_def_in_docker(args.cluster_spec),
     ]
     container_args.extend(
         build_arguments_from_parsed_result(
-            args, filter_args=["model_zoo", "cluster_spec", "worker_image"]
+            args,
+            filter_args=[
+                "model_zoo",
+                "cluster_spec",
+                "worker_image",
+                "force_use_kube_config_file",
+                "func",
+            ],
+        )
+    )
+
+    _submit_job(image_name, args, container_args)
+    # TODO: print dashboard url after launching the master pod
+
+
+def evaluate(args):
+    model_zoo = os.path.normpath(args.model_zoo)
+
+    image_pre_built = bool(args.image_name)
+
+    image_name = (
+        args.image_name
+        if image_pre_built
+        else build_and_push_docker_image(
+            model_zoo=model_zoo,
+            base_image=args.image_base,
+            docker_image_repository=args.docker_image_repository,
+            extra_pypi=args.extra_pypi_index,
+            cluster_spec=args.cluster_spec,
+            docker_base_url=args.docker_base_url,
+            docker_tlscert=args.docker_tlscert,
+            docker_tlskey=args.docker_tlskey,
+        )
+    )
+    container_args = [
+        "--worker_image",
+        image_name,
+        "--model_zoo",
+        _model_zoo_in_docker(model_zoo, image_pre_built),
+        "--cluster_spec",
+        _cluster_spec_def_in_docker(args.cluster_spec),
+    ]
+    container_args.extend(
+        build_arguments_from_parsed_result(
+            args,
+            filter_args=[
+                "model_zoo",
+                "cluster_spec",
+                "worker_image",
+                "force_use_kube_config_file",
+                "func",
+            ],
         )
     )
 
@@ -87,29 +114,39 @@ def evaluate(args):
 def predict(args):
     model_zoo = os.path.normpath(args.model_zoo)
 
-    image_name = build_and_push_docker_image(
-        model_zoo=model_zoo,
-        base_image=args.image_base,
-        docker_image_repository=args.docker_image_repository,
-        extra_pypi=args.extra_pypi_index,
-        cluster_spec=args.cluster_spec,
-        docker_base_url=args.docker_base_url,
-        docker_tlscert=args.docker_tlscert,
-        docker_tlskey=args.docker_tlskey,
+    image_pre_built = bool(args.image_name)
+
+    image_name = (
+        args.image_name
+        if image_pre_built
+        else build_and_push_docker_image(
+            model_zoo=model_zoo,
+            base_image=args.image_base,
+            docker_image_repository=args.docker_image_repository,
+            extra_pypi=args.extra_pypi_index,
+            cluster_spec=args.cluster_spec,
+            docker_base_url=args.docker_base_url,
+            docker_tlscert=args.docker_tlscert,
+            docker_tlskey=args.docker_tlskey,
+        )
     )
     container_args = [
-        "-m",
-        "elasticdl.python.master.main",
         "--worker_image",
         image_name,
         "--model_zoo",
-        _model_zoo_in_docker(model_zoo),
+        _model_zoo_in_docker(model_zoo, image_pre_built),
         "--cluster_spec",
         _cluster_spec_def_in_docker(args.cluster_spec),
     ]
     container_args.extend(
         build_arguments_from_parsed_result(
-            args, filter_args=["model_zoo", "cluster_spec", "worker_image"]
+            args,
+            filter_args=[
+                "model_zoo",
+                "cluster_spec",
+                "worker_image",
+                "force_use_kube_config_file",
+            ],
         )
     )
 
@@ -142,7 +179,20 @@ def _submit_job(image_name, client_args, container_args):
         job_name=client_args.job_name,
         event_callback=None,
         cluster_spec=client_args.cluster_spec,
+        force_use_kube_config_file=client_args.force_use_kube_config_file,
     )
+
+    container_args = wrap_python_args_with_string(container_args)
+
+    master_client_command = "python -m elasticdl.python.master.main"
+    container_args.insert(0, master_client_command)
+    if client_args.log_file_path:
+        container_args.append(
+            BashCommandTemplate.REDIRECTION.format(client_args.log_file_path)
+        )
+
+    python_command = " ".join(container_args)
+    container_args = ["-c", python_command]
 
     if client_args.yaml:
         client.dump_master_yaml(
@@ -178,8 +228,11 @@ def _submit_job(image_name, client_args, container_args):
         )
 
 
-def _model_zoo_in_docker(model_zoo):
-    MODEL_ROOT_PATH = "/model_zoo"
+def _model_zoo_in_docker(model_zoo, image_pre_built):
+    if image_pre_built:
+        return model_zoo
+
+    MODEL_ROOT_PATH = "/"
     return os.path.join(MODEL_ROOT_PATH, os.path.basename(model_zoo))
 
 

@@ -2,10 +2,16 @@
 
 import random
 import threading
+import time
+
+import tensorflow as tf
+from tensorflow.python.keras.callbacks import CallbackList
 
 from elasticdl.proto import elasticdl_pb2
 from elasticdl.python.common.constants import TaskExecCounterKey
 from elasticdl.python.common.log_utils import default_logger as logger
+
+_MAX_TASK_RETRIES = 3
 
 
 class _Task(object):
@@ -65,6 +71,7 @@ class _TaskDispatcher(object):
         prediction_shards,
         records_per_task,
         num_epochs,
+        callbacks_list=None,
     ):
         """
         Arguments:
@@ -77,6 +84,8 @@ class _TaskDispatcher(object):
             records_per_task: The number of records per task.
             num_epochs: The total number of epochs for the tasks where
                 an epoch is a complete iteration over the shards.
+            callbacks_list: The Keras CallbacksList object to contain all
+                callback instances.
         """
         self._lock = threading.Lock()
 
@@ -86,6 +95,7 @@ class _TaskDispatcher(object):
         self._evaluation_shards = evaluation_shards
         self._prediction_shards = prediction_shards
         self._records_per_task = records_per_task
+        self._init_callbacks(callbacks_list)
 
         self._todo = []
         # dictionary from task id to Task.
@@ -98,6 +108,7 @@ class _TaskDispatcher(object):
         self._tasks_done_deferred_callbacks = []
 
         self._job_counters = {}
+        self._task_retry_count = {}
 
         if self._training_shards:
             logger.info("Starting epoch %d", self._epoch)
@@ -106,6 +117,15 @@ class _TaskDispatcher(object):
             self.create_tasks(elasticdl_pb2.EVALUATION)
         elif self._prediction_shards:
             self.create_tasks(elasticdl_pb2.PREDICTION)
+
+    def _init_callbacks(self, callbacks_list):
+        if callbacks_list is None:
+            self._callbacks_list = CallbackList([])
+            self._callbacks_list.set_model(tf.keras.Model())
+        else:
+            self._callbacks_list = callbacks_list
+
+        self._callbacks_list.model.stop_training = False
 
     def reset_job_counters(self, task_type):
         """Return record number in specific task_type"""
@@ -180,17 +200,20 @@ class _TaskDispatcher(object):
                 return -1, None
             self._task_id += 1
             task = self._eval_todo.pop()
-            self._doing[self._task_id] = (worker_id, task)
+            self._doing[self._task_id] = (worker_id, task, time.time())
             return self._task_id, task
 
-    def _create_save_model_task(self, saved_model_path):
+    def _create_train_end_callback_task(self):
         """
-        Build one instance of SaveModel task and add it to todo list.
-        Because we need create a dataset to build the model,
-        we include a shard of data in this task.
+        Build one instance of training end task and add it to todo list.
+        Because we need create a dataset to build the model for
+        SavedModelExporter to execute on_train_end,we include
+        a shard of data in this task.
         """
+        if not self._training_shards:
+            return
 
-        self.reset_job_counters(elasticdl_pb2.SAVE_MODEL)
+        self.reset_job_counters(elasticdl_pb2.TRAIN_END_CALLBACK)
         shards = self._training_shards
         assert shards is not None
 
@@ -203,19 +226,18 @@ class _TaskDispatcher(object):
         )
 
         # Use the first shard of data to do the SavedModel work
-        save_model_task = _Task(
+        train_end_callback_task = _Task(
             shard_name=shard_name,
             start=start_ind_this_task,
             end=end_ind_this_task,
-            type=elasticdl_pb2.SAVE_MODEL,
-            saved_model_path=saved_model_path,
+            type=elasticdl_pb2.TRAIN_END_CALLBACK,
         )
 
-        self._todo.append(save_model_task)
+        self._todo.append(train_end_callback_task)
 
-    def add_deferred_callback_create_save_model_task(self, saved_model_path):
+    def add_deferred_callback_create_train_end_task(self):
         self._tasks_done_deferred_callbacks.append(
-            lambda: self._create_save_model_task(saved_model_path)
+            lambda: self._create_train_end_callback_task()
         )
 
     def invoke_deferred_callback(self):
@@ -240,7 +262,11 @@ class _TaskDispatcher(object):
         with self._lock:
             # TODO: check if task queue doesn't have training task,
             #       to avoid the queue is overwhelmed by evaluation tasks.
-            if not self._todo and self._epoch < self._num_epochs - 1:
+            if (
+                not self._todo
+                and not self._callbacks_list.model.stop_training
+                and self._epoch < self._num_epochs - 1
+            ):
                 # Start a new epoch
                 self._epoch += 1
                 self.create_tasks(elasticdl_pb2.TRAINING)
@@ -253,7 +279,7 @@ class _TaskDispatcher(object):
             self._task_id += 1
             task = self._todo.pop()
             # TODO: Handle timeout of tasks.
-            self._doing[self._task_id] = (worker_id, task)
+            self._doing[self._task_id] = (worker_id, task, time.time())
 
             return self._task_id, task
 
@@ -263,7 +289,9 @@ class _TaskDispatcher(object):
         task_id = request.task_id
         evaluation_task_completed = False
         with self._lock:
-            _, task = self._doing.pop(task_id, (-1, None))
+            worker_id, task, start_time = self._doing.pop(
+                task_id, (-1, None, -1)
+            )
             if task:
                 self._job_counters[
                     task.type
@@ -273,24 +301,49 @@ class _TaskDispatcher(object):
             if not task:
                 logger.warning("Unknown task_id: %d" % task_id)
             elif not success:
-                # TODO: keep count of retries.
-                if task.type == elasticdl_pb2.TRAINING:
-                    self._todo.append(task)
-                else:
-                    self._eval_todo.append(task)
+                logger.warning("Task %d of %s failed " % (task_id, task.type))
+                if not self.check_exceed_max_task_retries(task):
+                    if task.type in [
+                        elasticdl_pb2.TRAINING,
+                        elasticdl_pb2.TRAIN_END_CALLBACK,
+                    ]:
+                        self._todo.append(task)
+                    else:
+                        self._eval_todo.append(task)
             elif (
                 task.type == elasticdl_pb2.EVALUATION
                 and self._evaluation_service is not None
             ):
                 evaluation_task_completed = True
             else:
+                self._call_on_task_end(task)
                 logger.info(
                     "Task:%d completed, %d remaining tasks",
                     task_id,
                     len(self._todo) + len(self._doing),
                 )
-        if evaluation_task_completed:
-            self._evaluation_service.complete_task()
+            if evaluation_task_completed:
+                self._evaluation_service.complete_task()
+
+            if success:
+                if task in self._task_retry_count:
+                    del self._task_retry_count[task]
+                if self._callbacks_list.model.stop_training:
+                    # Clear todo list to stop training
+                    self._todo = []
+
+        return (time.time() - start_time), task, worker_id
+
+    def check_exceed_max_task_retries(self, task):
+        self._task_retry_count.setdefault(task, 1)
+        self._task_retry_count[task] += 1
+        if self._task_retry_count[task] > _MAX_TASK_RETRIES:
+            logger.error(
+                "A %s task failed with %d retries "
+                % (task.type, _MAX_TASK_RETRIES)
+            )
+            return True
+        return False
 
     def finished(self):
         """Return if all tasks are done"""
@@ -301,7 +354,9 @@ class _TaskDispatcher(object):
 
         with self._lock:
             ids = [
-                id for id, (wid, _) in self._doing.items() if wid == worker_id
+                id
+                for id, (wid, _, _) in self._doing.items()
+                if wid == worker_id
             ]
         request = elasticdl_pb2.ReportTaskResultRequest()
         for id in ids:
@@ -314,3 +369,11 @@ class _TaskDispatcher(object):
             self._evaluation_service = evaluation_service
             if self._evaluation_shards and not self._training_shards:
                 evaluation_service.init_eval_only_job(len(self._eval_todo))
+
+    def _call_on_task_end(self, task):
+        # The on_task_end is not a method of tf.keras.callbacks.Callback
+        # and tf.keras.callbacks.CallbackList. So, we need to check
+        # before calling the method.
+        for callback in self._callbacks_list.callbacks:
+            if hasattr(callback, "on_task_end"):
+                callback.on_task_end(task)

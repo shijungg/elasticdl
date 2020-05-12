@@ -2,30 +2,36 @@
 
 ## Development Docker Image
 
-Development Docker image contains dependencies for ElasticDL development and processed demo data in RecordIO format. In repo's root directory, run the following command:
+Note that Docker 17.05 or higher is required to build docker images, as Dockerfile is using multi-stage build.
+
+Development Docker image contains dependencies for ElasticDL development. In repo's root directory, run the following command:
 
 ```bash
 docker build \
+    --target dev \
     -t elasticdl:dev \
-    -f elasticdl/docker/Dockerfile.dev .
+    -f elasticdl/docker/Dockerfile .
 ```
 
 To build the Docker image with GPU support, run the following command:
 
 ```bash
 docker build \
+    --target dev \
     -t elasticdl:dev-gpu \
     -f elasticdl/docker/Dockerfile \
-    --build-arg BASE_IMAGE=tensorflow/tensorflow:2.0.0-gpu-py3 .
+    --build-arg BASE_IMAGE=tensorflow/tensorflow:2.1.0-gpu-py3 .
 ```
 
 Note that since ElasticDL depends on TensorFlow, the base image must have TensorFlow installed.
 
-When having difficulties downloading from the main PyPI site, you could pass an extra PyPI index url to `docker build`, such as:
+When having difficulties downloading from the main PyPI site or Golang site, you could pass some extra build arguments to `docker build`, `EXTRA_PYPI_INDEX` for PyPI site and `GO_MIRROR_URL` for the mirror of Golang installation package:
 
 ```bash
 docker build \
     --build-arg EXTRA_PYPI_INDEX=https://mirrors.aliyun.com/pypi/simple \
+    --build-arg GO_MIRROR_URL=http://mirrors.ustc.edu.cn/golang \
+    --target dev \
     -t elasticdl:dev \
     -f elasticdl/docker/Dockerfile .
 ```
@@ -43,12 +49,13 @@ docker run --rm -u $(id -u):$(id -g) -it \
 
 ## Continuous Integration Docker Image
 
-Continuous integration docker image contains everything from the development docker image and the ElasticDL source code. It is  used to run continuous integration with the latest version of the source code. In repo's root directory, run the following command:
+Continuous integration docker image contains everything from the development docker image, processed demo data in RecordIO format and the ElasticDL source code. It is used to run continuous integration with the latest version of the source code. In repo's root directory, run the following command:
 
 ```bash
 docker build \
+    --target ci \
     -t elasticdl:ci \
-    -f elasticdl/docker/Dockerfile.ci .
+    -f elasticdl/docker/Dockerfile .
 ```
 
 ## Test and Debug
@@ -61,7 +68,7 @@ We have set up pre-commit checks in the Github repo for pull requests, which can
 docker run --rm -it -v $EDL_REPO:/edl_dir -w /edl_dir \
     elasticdl:dev \
     bash -c \
-    "pre-commit run --files $(find elasticdl/python model_zoo -name '*.py' -print0 | tr '\0' ' ')"
+    "pre-commit run --files $(find elasticdl/python elasticdl_preprocessing model_zoo setup.py scripts/ -name '*.py' -print0 | tr '\0' ' ') $(find elasticdl/pkg -name '*.go' -print0 | tr '\0' ' ')"
 ```
 
 ### Unit Tests
