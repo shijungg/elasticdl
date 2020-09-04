@@ -1,9 +1,23 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import csv
 import os
 import tempfile
 from collections.__init__ import namedtuple
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import Mock
 
 import grpc
 import numpy as np
@@ -11,28 +25,25 @@ import recordio
 import tensorflow as tf
 from odps import ODPS
 
-from elasticdl.proto import elasticdl_pb2
 from elasticdl.python.common.args import parse_worker_args
-from elasticdl.python.common.constants import (
-    DistributionStrategy,
-    JobType,
-    MaxComputeConfig,
-)
+from elasticdl.python.common.constants import JobType, MaxComputeConfig
 from elasticdl.python.common.grpc_utils import build_channel
 from elasticdl.python.common.model_utils import (
     get_module_file_path,
     load_module,
 )
-from elasticdl.python.common.save_utils import CheckpointSaver
 from elasticdl.python.data.recordio_gen.frappe_recordio_gen import (
     load_raw_data,
 )
 from elasticdl.python.master.evaluation_service import EvaluationService
 from elasticdl.python.master.servicer import MasterServicer
 from elasticdl.python.master.task_dispatcher import _TaskDispatcher
-from elasticdl.python.ps.parameter_server import Parameters, ParameterServer
-from elasticdl.python.tests.in_process_master import InProcessMaster
+from elasticdl.python.ps.parameter_server import ParameterServer
+from elasticdl.python.tests.mock_service import _server
+from elasticdl.python.worker.master_client import MasterClient
+from elasticdl.python.worker.ps_client import PSClient
 from elasticdl.python.worker.worker import Worker
+from elasticdl_client.common.constants import DistributionStrategy
 
 
 class PserverArgs(object):
@@ -265,6 +276,10 @@ def create_pserver(
         pserver = ParameterServer(args)
         pserver.prepare()
         pservers.append(pserver)
+
+    for channel in channels:
+        grpc.channel_ready_future(channel).result()
+
     return ports, channels, pservers
 
 
@@ -277,7 +292,6 @@ def distributed_train_and_evaluate(
     loss="loss",
     training=True,
     dataset_name=DatasetName.IMAGE_DEFAULT,
-    callback_classes=[],
     use_async=False,
     get_model_steps=1,
     ps_channels=None,
@@ -301,8 +315,6 @@ def distributed_train_and_evaluate(
         training: True for job type `TRAIN_WITH_EVALUATION`, False for
             job type `EVALUATION`.
         dataset_name: A dataset name from `DatasetName`.
-        callback_classes: A List of callbacks that will be called at given
-            stages of the training procedure.
         use_async: A bool. True if using asynchronous updates.
         get_model_steps: Worker will perform `get_model` from the parameter
             server every this many steps.
@@ -330,8 +342,6 @@ def distributed_train_and_evaluate(
         get_module_file_path(model_zoo_path, model_def)
     ).__dict__
 
-    for channel in ps_channels:
-        grpc.channel_ready_future(channel).result()
     worker_arguments = [
         "--worker_id",
         "1",
@@ -353,7 +363,6 @@ def distributed_train_and_evaluate(
         distribution_strategy,
     ]
     args = parse_worker_args(worker_arguments)
-    worker = Worker(args, ps_channels=ps_channels)
 
     if dataset_name in [DatasetName.IMAGENET, DatasetName.FRAPPE]:
         record_num = batch_size
@@ -383,8 +392,6 @@ def distributed_train_and_evaluate(
         evaluation_service = EvaluationService(
             None,
             task_d,
-            0,
-            0,
             evaluation_steps,
             False,
             model_module[eval_metrics_fn],
@@ -393,37 +400,40 @@ def distributed_train_and_evaluate(
         evaluation_service = EvaluationService(
             None,
             task_d,
-            0,
-            0,
             evaluation_steps,
             True,
             model_module[eval_metrics_fn],
         )
     task_d.set_evaluation_service(evaluation_service)
 
-    master = MasterServicer(
-        batch_size, task_d, evaluation_service=evaluation_service,
+    master = Mock(
+        task_d=task_d, instance_manager=None, distribution_strategy=None,
     )
-    callbacks = [
-        callback_class(master, worker) for callback_class in callback_classes
-    ]
 
-    in_process_master = InProcessMaster(master, callbacks)
-    worker._stub = in_process_master
+    def master_creator():
+        return MasterServicer(
+            batch_size, evaluation_service=evaluation_service, master=master,
+        )
+
+    svc, port = _server(master_creator)
+    mc = MasterClient(build_channel("localhost:%d" % port), 1)
+    worker = Worker(args, master_client=mc, ps_client=PSClient(ps_channels))
+
     for pservicer in pservers:
-        pservicer._master_stub = in_process_master
+        # FIXME(yancey1989): decouple pserver and master client
+        pservicer._master_stub = mc
 
     worker.run()
 
-    req = elasticdl_pb2.GetTaskRequest()
-    req.worker_id = 1
-    task = master.get_task(req, None)
+    task = mc.get_task()
+    # stop the master servicer
+    svc.stop(0)
     # No more task.
     if task.shard_name:
         raise RuntimeError(
             "There are some tasks unfinished after worker exits."
         )
-    return master._version
+    return task.model_version
 
 
 IRIS_TABLE_COLUMN_NAMES = [
@@ -443,7 +453,7 @@ def create_iris_odps_table(odps_client, project_name, table_name):
            sepal_width  DOUBLE,
            petal_length DOUBLE,
            petal_width  DOUBLE,
-           class BIGINT);
+           class BIGINT) LIFECYCLE 3;
 
     INSERT INTO {PROJECT_NAME}.{TABLE_NAME} VALUES
     (6.4,2.8,5.6,2.2,2),
@@ -630,13 +640,3 @@ def get_frappe_dataset(batch_size):
     test_db = tf.data.Dataset.from_tensor_slices((x_test, y_test))
     test_db = test_db.batch(batch_size)
     return db, test_db
-
-
-def save_checkpoint_without_embedding(model, checkpoint_dir, version=100):
-    checkpoint_saver = CheckpointSaver(checkpoint_dir, 0, 0, False)
-    params = Parameters()
-    for var in model.trainable_variables:
-        params.non_embedding_params[var.name] = var
-    params.version = version
-    model_pb = params.to_model_pb()
-    checkpoint_saver.save(version, model_pb, False)

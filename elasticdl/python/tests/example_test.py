@@ -1,3 +1,16 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import unittest
 
@@ -96,8 +109,8 @@ class ExampleTest(unittest.TestCase):
 
     def test_mnist_train(self):
         model_defs = [
-            "mnist_functional_api.mnist_functional_api.custom_model",
-            "mnist_subclass.mnist_subclass.CustomModel",
+            "mnist.mnist_functional_api.custom_model",
+            "mnist.mnist_subclass.CustomModel",
         ]
 
         model_versions = []
@@ -113,16 +126,18 @@ class ExampleTest(unittest.TestCase):
 
     def test_mnist_evaluate(self):
         model_defs = [
-            "mnist_functional_api.mnist_functional_api.custom_model",
-            "mnist_subclass.mnist_subclass.CustomModel",
+            "mnist.mnist_functional_api.custom_model",
+            "mnist.mnist_subclass.CustomModel",
         ]
         for model_def in model_defs:
             self._test_evaluate([28, 28], model_def)
 
     def test_cifar10_train(self):
         model_defs = [
-            "cifar10_functional_api.cifar10_functional_api.custom_model",
-            "cifar10_subclass.cifar10_subclass.CustomModel",
+            "cifar10.cifar10_functional_api.custom_model",
+            "cifar10.cifar10_subclass.CustomModel",
+            "cifar10.cifar10_resnet50.custom_model",
+            "cifar10.cifar10_mobilenetv2.custom_model",
         ]
 
         model_versions = []
@@ -135,8 +150,8 @@ class ExampleTest(unittest.TestCase):
 
     def test_cifar10_evaluate(self):
         model_defs = [
-            "cifar10_functional_api.cifar10_functional_api.custom_model",
-            "cifar10_subclass.cifar10_subclass.CustomModel",
+            "cifar10.cifar10_functional_api.custom_model",
+            "cifar10.cifar10_subclass.CustomModel",
         ]
         for model_def in model_defs:
             self._test_evaluate(

@@ -1,7 +1,20 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import tensorflow as tf
 
 
-class ConcatenateWithOffset(tf.keras.layers.Concatenate):
+class ConcatenateWithOffset(tf.keras.layers.Layer):
     """Layer that add offset to each id tensor in the input list and
     then concatenate these tensors.
 
@@ -42,6 +55,9 @@ class ConcatenateWithOffset(tf.keras.layers.Concatenate):
 
     def _call_with_offsets(self, inputs):
         ids_with_offset = []
+        if not isinstance(inputs, list):
+            return inputs
+
         if len(self.offsets) != len(inputs):
             raise ValueError(
                 "The offsets length is not equal to inputs length"
@@ -66,9 +82,7 @@ class ConcatenateWithOffset(tf.keras.layers.Concatenate):
                 axis=self.axis, sp_inputs=ids_with_offset
             )
         else:
-            result = tf.keras.layers.concatenate(
-                ids_with_offset, axis=self.axis
-            )
+            result = tf.concat(ids_with_offset, axis=self.axis)
 
         return result
 
@@ -76,6 +90,6 @@ class ConcatenateWithOffset(tf.keras.layers.Concatenate):
         if isinstance(inputs[0], tf.SparseTensor):
             result = tf.sparse.concat(axis=self.axis, sp_inputs=inputs)
         else:
-            result = tf.keras.layers.concatenate(inputs, axis=self.axis)
+            result = tf.concat(inputs, axis=self.axis)
 
         return result

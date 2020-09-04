@@ -1,26 +1,31 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
-import time
 import traceback
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import backend as K
 
-from elasticdl.proto import elasticdl_pb2, elasticdl_pb2_grpc
-from elasticdl.python.collective_ops.communicator import CollectiveCommunicator
+from elasticdl.proto import elasticdl_pb2
 from elasticdl.python.common.constants import (
-    CollectiveCommunicatorStatus,
-    DistributionStrategy,
+    Initializer,
     JobType,
     MetricsDictKey,
     Mode,
 )
 from elasticdl.python.common.dtypes import dtype_numpy_to_tensor
-from elasticdl.python.common.hash_utils import (
-    int_to_id,
-    scatter_embedding_vector,
-    string_to_id,
-)
 from elasticdl.python.common.log_utils import get_logger
 from elasticdl.python.common.model_handler import ModelHandler
 from elasticdl.python.common.model_utils import (
@@ -30,30 +35,20 @@ from elasticdl.python.common.model_utils import (
     get_non_embedding_trainable_vars,
     set_callback_parameters,
 )
-from elasticdl.python.common.tensor_utils import (
-    Tensor,
-    deduplicate_indexed_slices,
-    merge_indexed_slices,
-    pb_to_ndarray,
-    serialize_indexed_slices,
-    serialize_ndarray,
-)
+from elasticdl.python.common.tensor_utils import EmbeddingTableInfo, Tensor
 from elasticdl.python.common.timing_utils import Timing
 from elasticdl.python.elasticdl.callbacks import SavedModelExporter
 from elasticdl.python.elasticdl.feature_column import feature_column
 from elasticdl.python.elasticdl.layers.embedding import Embedding
+from elasticdl.python.worker.allreduce_trainer import AllReduceTrainer
 from elasticdl.python.worker.task_data_service import TaskDataService
+from elasticdl_client.common.constants import DistributionStrategy
 
 # The default maximum number of a minibatch retry as its results
 # (e.g. gradients) are not accepted by master.
 DEFAULT_MAX_MINIBATCH_RETRY_NUM = 64
 
-# The default maximum number of retries for allreduce operation
-# if allreduce-based distributed training strategy is used.
-DEFAULT_MAX_ALLREDUCE_RETRY_NUM = 5
-# The default timeout in seconds allowed for reinitializing the
-# collective communicator.
-DEFAULT_COMMUNICATOR_REINITIALIZING_TIMEOUT = 20
+DEFAULT_STEPS_TO_CHECK_RENDEZVOUS = 20
 
 
 class Worker(object):
@@ -62,10 +57,9 @@ class Worker(object):
     def __init__(
         self,
         args,
-        channel=None,
-        ps_channels=None,
+        master_client=None,
+        ps_client=None,
         max_minibatch_retry_num=DEFAULT_MAX_MINIBATCH_RETRY_NUM,
-        max_allreduce_retry_num=DEFAULT_MAX_ALLREDUCE_RETRY_NUM,
         set_parallelism=False,
     ):
         """
@@ -90,38 +84,27 @@ class Worker(object):
             tf.config.threading.set_inter_op_parallelism_threads(num_threads)
             tf.config.threading.set_intra_op_parallelism_threads(num_threads)
 
-        if channel is None:
-            self._stub = None
-        else:
-            self._stub = elasticdl_pb2_grpc.MasterStub(channel)
-
-        self._use_multi_ps = False
-        self._ps_vars = {}
-        if isinstance(ps_channels, list):
-            if len(ps_channels) > 0:
-                self._use_multi_ps = True
-                self._ps_stubs = [
-                    elasticdl_pb2_grpc.PserverStub(c) for c in ps_channels
-                ]
-                self._var_to_ps = {}
-                self._ps_num = len(self._ps_stubs)
-        else:
-            self._ps_num = 0
+        self._mc = master_client
+        self._ps_client = ps_client
         self._distribution_strategy = args.distribution_strategy
         if (
             self._distribution_strategy
             == DistributionStrategy.PARAMETER_SERVER
-            and self._use_multi_ps is False
         ):
-            raise ValueError(
-                "PS channels are not set up under parameter server strategy"
-            )
-
+            if self._ps_client is None:
+                raise ValueError(
+                    "PS channels are not set up under "
+                    "parameter server strategy"
+                )
+            else:
+                self._model_versions_from_ps = [
+                    -1 for _ in range(self._ps_client.ps_num)
+                ]
         self._max_minibatch_retry_num = max_minibatch_retry_num
-        self._max_allreduce_retry_num = max_allreduce_retry_num
         self._init_from_args(args)
         self._timing = Timing(args.log_level.upper() == "DEBUG", self.logger)
         self._log_loss_count = 0
+        self._var_created = False
 
     def _init_from_args(self, args):
         """
@@ -148,19 +131,11 @@ class Worker(object):
             loss=args.loss,
             optimizer=args.optimizer,
             eval_metrics_fn=args.eval_metrics_fn,
-            model_params=args.model_params,
             prediction_outputs_processor=args.prediction_outputs_processor,
             custom_data_reader=args.custom_data_reader,
             callbacks=args.callbacks,
         )
 
-        self._collective_communicator = (
-            CollectiveCommunicator(
-                service_name=args.collective_communicator_service_name
-            )
-            if self._distribution_strategy == DistributionStrategy.ALLREDUCE
-            else None
-        )
         self._model_handler = ModelHandler.get_model_handler(
             self._distribution_strategy, checkpoint_dir=args.checkpoint_dir
         )
@@ -168,11 +143,10 @@ class Worker(object):
         self.set_model(model_inst)
 
         self._model_version = -1
-        if self._distribution_strategy != DistributionStrategy.ALLREDUCE:
-            self._model_versions_from_ps = [-1 for _ in range(self._ps_num)]
         self._task_data_service = TaskDataService(
-            self,
+            self._mc,
             self._job_type == JobType.TRAINING_WITH_EVALUATION,
+            custom_data_reader=self._custom_data_reader,
             data_reader_params=get_dict_from_params_str(
                 args.data_reader_params
             ),
@@ -208,6 +182,14 @@ class Worker(object):
             saved_model_path=args.output,
             checkpoint_path=args.checkpoint_dir,
         )
+        self._saved_model_path = args.output
+
+        self._allreduce_trainer = None
+        if self._distribution_strategy == DistributionStrategy.ALLREDUCE:
+            master_addr = args.master_addr.split(":")[0]
+            self._allreduce_trainer = AllReduceTrainer(
+                self._mc, master_addr, self._model, self._loss, self._opt
+            )
 
     # TODO: Multiple tests are currently using this function to initialize
     # self._model, where the initialization should be done via constructor.
@@ -216,24 +198,20 @@ class Worker(object):
         self._model = model_inst
         self._train_eagerly = False
         self._init_embeddings()
-        self._var_created = self._model.built
-        self._non_embed_vars = {}
-        if self._var_created:
-            for var in get_non_embedding_trainable_vars(
-                self._model, self._embedding_layers
-            ):
-                self._non_embed_vars[var.name] = var
-            if self._use_multi_ps:
-                self.init_ps_var_partition()
 
     def _init_embedding_layer(self):
         """
         Init elasticdl.layers.embedding layer list and assign worker to them
         """
         self._embedding_layers = find_layer(self._model, Embedding)
-        if self._use_multi_ps:
+        if (
+            self._distribution_strategy
+            == DistributionStrategy.PARAMETER_SERVER
+        ):
             for layer in self._embedding_layers:
-                layer.set_lookup_embedding_func(self.pull_embedding_vectors)
+                layer.set_lookup_embedding_func(
+                    self._ps_client.pull_embedding_vectors
+                )
 
     def _init_embedding_column(self):
         self._embedding_columns = []
@@ -248,9 +226,14 @@ class Worker(object):
                             )
                         )
 
-        if self._use_multi_ps:
+        if (
+            self._distribution_strategy
+            == DistributionStrategy.PARAMETER_SERVER
+        ):
             for column in self._embedding_columns:
-                column.set_lookup_embedding_func(self.pull_embedding_vectors)
+                column.set_lookup_embedding_func(
+                    self._ps_client.pull_embedding_vectors
+                )
 
     def _check_name_conflict_of_embedding_layer_and_column(self):
         if not self._embedding_layers or not self._embedding_columns:
@@ -277,7 +260,10 @@ class Worker(object):
         self._init_embedding_column()
         self._check_name_conflict_of_embedding_layer_and_column()
 
-        if self._use_multi_ps:
+        if (
+            self._distribution_strategy
+            == DistributionStrategy.PARAMETER_SERVER
+        ):
             self.report_embedding_info()
 
         self._need_embedding_layer_check = (
@@ -308,163 +294,76 @@ class Worker(object):
         )
         self._non_embed_grads = None
 
-    def get_task(self, task_type=None):
-        """
-        get task from master
-        """
-        req = elasticdl_pb2.GetTaskRequest()
-        req.worker_id = self._worker_id
-        if task_type is not None:
-            req.task_type = task_type
-
-        try:
-            res = self._stub.get_task(req)
-        except Exception:
-            # Master may have stopped GRPC service when there are no more
-            # tasks. This will result in a GRPC call exception.
-            self.logger.info(
-                "Cannot connect to master, assuming no more tasks"
-            )
-            res = elasticdl_pb2.Task()
-        return res
-
     def get_model(self):
         self._timing.start_record_time("get_model")
-        if self._distribution_strategy != DistributionStrategy.ALLREDUCE:
-            variable_future_and_id_pairs = []
-            if self._use_multi_ps:
-                self.init_ps_var_partition()
-            for ps_id, stub in enumerate(self._ps_stubs):
-                if ps_id not in self._ps_vars:
-                    continue
-                # async grpc call
-                req = elasticdl_pb2.PullDenseParametersRequest()
-                req.version = self._model_versions_from_ps[ps_id]
-                var_future = stub.pull_dense_parameters.future(req)
-                variable_future_and_id_pairs.append((var_future, ps_id))
+        if (
+            self._distribution_strategy
+            == DistributionStrategy.PARAMETER_SERVER
+        ):
+            # 1. Worker tries to pull dense parameters from the PS, maybe one
+            # or more PS instances are uninitialized.
+            dense_params, uninit_ps = self._ps_client.pull_dense_parameters(
+                [i for i in range(self._ps_client.ps_num)],
+                self._model_versions_from_ps,
+            )
 
-            for var_future, ps_id in variable_future_and_id_pairs:
-                res = var_future.result()
-                if not res.initialized:
+            # 2. Worker pushes local dense parameters to these PS instances
+            # to initialize their partition of parameters.
+            if len(uninit_ps) > 0:
+                for ps_id in uninit_ps:
                     # push variable to ps for initialization
-                    self.report_variable_to_ps(ps_id)
-                    req = elasticdl_pb2.PullDenseParametersRequest()
-                    req.version = self._model_versions_from_ps[ps_id]
-                    res = self._ps_stubs[ps_id].pull_dense_parameters(req)
-                    if not res.initialized:
-                        # TODO: support PS fault-tolerance
-                        raise RuntimeError(
-                            "PS pod %d cannot be initialized" % ps_id
-                        )
+                    parameters = [
+                        Tensor(name, self._non_embed_vars[name].numpy(), None)
+                        for name in self._ps_client.ps_to_parameter[ps_id]
+                    ]
+                    self._ps_client.push_dense_parameters(
+                        parameters, ps_id, self._model_versions_from_ps[ps_id]
+                    )
 
-                for name, pb in res.dense_parameters.items():
-                    self._non_embed_vars[name].assign(pb_to_ndarray(pb))
-                self._model_versions_from_ps[ps_id] = res.version
+                ps_params, uninit = self._ps_client.pull_dense_parameters(
+                    uninit_ps, self._model_versions_from_ps
+                )
+                if len(uninit) > 0:
+                    # TODO: support PS fault-tolerance
+                    raise RuntimeError("PS initialization failed")
+                dense_params.update(ps_params)
+
+            # 3. Assign parameters to local model
+            for k, v in dense_params.items():
+                self._non_embed_vars[k].assign(v)
 
             self._model_version = max(self._model_versions_from_ps)
         self._timing.end_record_time("get_model")
 
-    def pull_embedding_vectors(self, layer_name, embedding_ids):
-        """Pulls and returns embedding vectors ordered by the embedding ids."""
-        ps_ids = {}
-        ps_ids_index = {}
-        for idx, embedding_id in enumerate(embedding_ids):
-            ps_id = int_to_id(embedding_id, self._ps_num)
-            ps_ids.setdefault(ps_id, []).append(embedding_id)
-            ps_ids_index.setdefault(ps_id, []).append(idx)
-
-        embeddings = []
-        index = []
-        pb_future_and_id_pairs = []
-        for ps_id, embedding_ids in ps_ids.items():
-            req = elasticdl_pb2.PullEmbeddingVectorRequest()
-            req.name = layer_name
-            req.ids.extend(embedding_ids)
-            pb_future = self._ps_stubs[ps_id].pull_embedding_vectors.future(
-                req
-            )
-            pb_future_and_id_pairs.append((pb_future, ps_id))
-        for pb_future, ps_id in pb_future_and_id_pairs:
-            pb = pb_future.result()
-            embeddings.append(pb_to_ndarray(pb))
-            index.extend(ps_ids_index[ps_id])
-        embeddings = np.concatenate(embeddings)
-
-        # adjust the order of embedding vectors
-        new_embeddings = np.empty_like(embeddings)
-        new_embeddings[index] = embeddings
-        return new_embeddings
-
-    def report_task_result(self, task_id, err_msg, exec_counters=None):
-        """
-        report task result to master
-        """
-        report = elasticdl_pb2.ReportTaskResultRequest()
-        report.task_id = task_id
-        report.err_message = err_msg
-        if isinstance(exec_counters, dict):
-            report.exec_counters.update(exec_counters)
-        return self._stub.report_task_result(report)
-
-    def init_ps_var_partition(self):
-        ps_vars = {}
-        for v in self._non_embed_vars.values():
-            if v.name not in self._var_to_ps:
-                self._var_to_ps[v.name] = string_to_id(v.name, self._ps_num)
-            ps_id = self._var_to_ps[v.name]
-            if ps_id not in ps_vars:
-                ps_vars[ps_id] = [v]
-            else:
-                ps_vars[ps_id].append(v)
-        self._ps_vars = ps_vars
-
     def report_embedding_info(self):
-        model = elasticdl_pb2.Model()
+        # TODO(qijun): only support float32
+        infos = []
         if self._embedding_layers:
-            embedding_infos = model.embedding_table_infos
             for layer in self._embedding_layers:
-                embedding_info = embedding_infos.add()
-                embedding_info.name = layer.embedding_weight_name
-                embedding_info.dim = layer.output_dim
-                embedding_info.initializer = layer.embeddings_initializer
-                # set to float32
-                embedding_info.dtype = dtype_numpy_to_tensor(
-                    np.dtype("float32")
+                infos.append(
+                    EmbeddingTableInfo(
+                        layer.embedding_weight_name,
+                        layer.output_dim,
+                        layer.embeddings_initializer,
+                        dtype_numpy_to_tensor(np.dtype("float32")),
+                    )
                 )
 
         if self._embedding_columns:
-            embedding_infos = model.embedding_table_infos
             for column in self._embedding_columns:
-                embedding_info = embedding_infos.add()
-                embedding_info.name = column.embedding_weight_name
-                embedding_info.dim = column.dimension
                 # TODO(brightcoder01): The initializer in embedding column is
                 # a variable initializer function. For embedding layer, it's a
                 # tf.keras.initializers. Keep aligned between these two.
-                embedding_info.initializer = "uniform"
-                # set to float32
-                embedding_info.dtype = dtype_numpy_to_tensor(
-                    np.dtype("float32")
+                infos.append(
+                    EmbeddingTableInfo(
+                        column.embedding_weight_name,
+                        column.dimension,
+                        Initializer.UNIFORM,
+                        dtype_numpy_to_tensor(np.dtype("float32")),
+                    )
                 )
 
-        for ps_id in range(self._ps_num):
-            self._ps_stubs[ps_id].push_embedding_table_infos(model)
-
-    def report_variable_to_ps(self, ps_id):
-        model = elasticdl_pb2.Model()
-        model.version = self._model_versions_from_ps[ps_id]
-        if ps_id in self._ps_vars:
-            vars = self._ps_vars[ps_id]
-            for var in vars:
-                serialize_ndarray(
-                    var.numpy(), model.dense_parameters[var.name]
-                )
-        self._ps_stubs[ps_id].push_model(model)
-
-    def report_variable(self):
-        # TODO: call `push_model` in parallel
-        for ps_id in range(self._ps_num):
-            self.report_variable_to_ps(ps_id)
+        self._ps_client.push_embedding_table_infos(infos)
 
     def _collect_edl_embedding_name_values(self):
         """
@@ -489,57 +388,36 @@ class Worker(object):
 
         return embedding_name_values
 
-    def report_gradient_to_ps(self, grads):
+    def report_gradient(self, gradients):
         self._timing.start_record_time("report_gradient")
-        reqs = [
-            elasticdl_pb2.PushGradientsRequest() for i in range(self._ps_num)
-        ]
-        ps_grads = {}
-        non_embed_vars_n = len(self._non_embed_vars)
-        for g, v in zip(
-            grads[:non_embed_vars_n], self._non_embed_vars.values()
-        ):
-            ps_id = self._var_to_ps[v.name]
-            if ps_id not in ps_grads:
-                ps_grads[ps_id] = {v.name: g}
+
+        grads = []
+        for i, v in enumerate(self._non_embed_vars.values()):
+            if isinstance(gradients[i], tf.IndexedSlices):
+                grad = Tensor(
+                    v.name,
+                    gradients[i].values.numpy(),
+                    gradients[i].indices.numpy(),
+                )
             else:
-                if v.name not in ps_grads[ps_id]:
-                    ps_grads[ps_id][v.name] = g
-                else:
-                    if isinstance(g, tf.IndexedSlices):
-                        ps_grads[ps_id][v.name] = merge_indexed_slices(
-                            ps_grads[ps_id][v.name], g
-                        )
-                    else:
-                        ps_grads[ps_id][v.name] += g
+                grad = Tensor(v.name, gradients[i].numpy(), None)
+            grads.append(grad)
 
-        for ps_id, pair in ps_grads.items():
-            for name, g in pair.items():
-                if isinstance(g, tf.IndexedSlices):
-                    v, i = deduplicate_indexed_slices(g.values, g.indices)
-                    ps_grads[ps_id][name] = tf.IndexedSlices(v, i)
-
-        for ps_id in ps_grads:
-            req = reqs[ps_id]
-            for name, g in ps_grads[ps_id].items():
-                # Keras embedding layer has a dense parameter,
-                # but an indexed slices type gradient
-                if isinstance(g, tf.IndexedSlices):
-                    serialize_indexed_slices(
-                        Tensor(None, g.values.numpy(), g.indices.numpy()),
-                        req.gradients.embedding_tables[name],
-                    )
-                else:
-                    serialize_ndarray(
-                        g.numpy(), req.gradients.dense_parameters[name]
-                    )
-
+        edl_grads = []
         edl_embedding_name_values = self._collect_edl_embedding_name_values()
-
         if edl_embedding_name_values:
-            edl_embedding_grads = grads[non_embed_vars_n:]
+            non_embed_vars_n = len(self._non_embed_vars)
+            edl_embedding_grads = gradients[non_embed_vars_n:]
             bet_number = 0
             for name, embedding_and_ids in edl_embedding_name_values:
+
+                for i in range(bet_number):
+                    grad = Tensor(
+                        name,
+                        edl_embedding_grads[i + bet_number].values.numpy(),
+                        edl_embedding_grads[i + bet_number].indices.numpy(),
+                    )
+                    edl_grads.append(grad)
                 bet_number += len(embedding_and_ids)
             if len(edl_embedding_grads) != bet_number:
                 raise ValueError(
@@ -547,93 +425,12 @@ class Worker(object):
                     "does not match the number of its output tensor %d."
                     % (len(edl_embedding_grads), bet_number)
                 )
-
-            grad_accum_iter = 0
-            for name, embedding_and_ids in edl_embedding_name_values:
-                g_values = None
-                g_indices = None
-                for _, ids in embedding_and_ids:
-                    grad = edl_embedding_grads[grad_accum_iter]
-                    grad_accum_iter += 1
-                    # ElasticDL embedding layer with Sparse Gradients
-                    if isinstance(grad, tf.IndexedSlices):
-                        grad = grad.values
-                    if g_values is not None:
-                        g_values = tf.concat([g_values, grad], axis=0)
-                        g_indices = tf.concat([g_indices, ids], axis=0)
-                    else:
-                        g_values = grad
-                        g_indices = ids
-
-                # Sum up the values of the duplicated indices in the
-                # gradients. It can reduce the gradient payload of the
-                # dense embedding.
-                g_values, g_indices = deduplicate_indexed_slices(
-                    values=g_values, indices=g_indices
-                )
-
-                results = scatter_embedding_vector(
-                    g_values.numpy(), g_indices.numpy(), self._ps_num
-                )
-
-                for ps_id in results:
-                    req = reqs[ps_id]
-                    gv, gi = results[ps_id]
-                    serialize_indexed_slices(
-                        Tensor(None, gv, gi),
-                        req.gradients.embedding_tables[name],
-                    )
-
-        report_futures = []
-        for ps_id in range(self._ps_num):
-            req = reqs[ps_id]
-            req.gradients.version = self._model_versions_from_ps[ps_id]
-            req.learning_rate = K.get_value(self._model.optimizer.lr)
-            report_future = self._ps_stubs[ps_id].push_gradients.future(req)
-            report_futures.append(report_future)
-
-        accepted = False
-        max_version = -1
-        for report_future in report_futures:
-            res = report_future.result()
-            if res.accepted:
-                accepted = True
-            if res.version > max_version:
-                max_version = res.version
+        learning_rate = K.get_value(self._model.optimizer.lr)
+        accepted, max_version = self._ps_client.push_gradients(
+            grads, edl_grads, learning_rate, self._model_versions_from_ps,
+        )
         self._timing.end_record_time("report_gradient")
         return accepted, max_version
-
-    def report_gradient_locally(self, grads):
-        if self._embedding_layers or self._embedding_columns:
-            raise ValueError(
-                "ElasticDL embedding layer is not supported when"
-                "reporting gradients locally"
-            )
-        self._non_embed_grads = grads[: len(self._non_embed_vars)]
-        return True, None
-
-    def report_gradient(self, grads):
-        if self._distribution_strategy == DistributionStrategy.ALLREDUCE:
-            self.report_gradient_locally(grads)
-            self._update_local_model()
-            return True, None
-        else:
-            if self._use_multi_ps:
-                return self.report_gradient_to_ps(grads)
-            raise RuntimeError("Only support report gradients to PS")
-
-    def report_evaluation_metrics(self, model_outputs, labels):
-        """
-        report evaluation metrics to ps.
-        """
-        req = elasticdl_pb2.ReportEvaluationMetricsRequest()
-        for name, output in model_outputs.items():
-            output = np.concatenate(output)
-            serialize_ndarray(output, req.model_outputs[name])
-        labels = np.concatenate(labels)
-        serialize_ndarray(labels, req.labels)
-        req.worker_id = self._worker_id
-        self._stub.report_evaluation_metrics(req)
 
     def report_prediction_outputs(self, predictions):
         if self._prediction_outputs_processor:
@@ -666,12 +463,15 @@ class Worker(object):
         ):
             self._non_embed_vars[var.name] = var
 
-        if not self._var_created:
-            if self._use_multi_ps:
-                self.init_ps_var_partition()
-            else:
-                self.report_variable()
-            self._var_created = True
+        self._var_created = True
+
+        if (
+            self._distribution_strategy
+            == DistributionStrategy.PARAMETER_SERVER
+        ):
+            self._ps_client.partition_dense_parameters(
+                self._non_embed_vars.keys()
+            )
 
         if self._need_embedding_layer_check:
             self._train_eagerly = False
@@ -748,65 +548,7 @@ class Worker(object):
     def _get_local_model_params(self):
         return [v for v in self._non_embed_vars.values()]
 
-    @staticmethod
-    def _get_rank_of_broadcast_src_worker():
-        return 0
-
-    def _broadcast_model_params(self):
-        status = self._collective_communicator.barrier()
-        if status == CollectiveCommunicatorStatus.FAILED:
-            self.logger.warning("Failed to perform barrier operation")
-            return False
-        broadcast_root_worker_rank = self._get_rank_of_broadcast_src_worker()
-        model_params = self._get_local_model_params()
-        status = self._collective_communicator.tf_broadcast(
-            model_params, broadcast_root_worker_rank
-        )
-        if status == CollectiveCommunicatorStatus.FAILED:
-            self.logger.warning("Failed to broadcast model parameters")
-            return False
-        return True
-
-    def _calculate_grads_and_report_with_allreduce(self, grads):
-        status, averaged_grads = self._collective_communicator.tf_allreduce(
-            grads
-        )
-        accepted = False
-        if status == CollectiveCommunicatorStatus.SUCCEEDED:
-            accepted, _ = self.report_gradient(averaged_grads)
-            if not accepted:
-                self.logger.warning("Failed to report the averaged gradients")
-        return accepted
-
-    def _collect_gradients_with_allreduce_robust(self, grads):
-        accepted = self._calculate_grads_and_report_with_allreduce(grads)
-        if not accepted:
-            start_time = time.time()
-            while not self._collective_communicator.is_initialized():
-                if (
-                    time.time() - start_time
-                    < DEFAULT_COMMUNICATOR_REINITIALIZING_TIMEOUT
-                ):
-                    self.logger.info(
-                        "(Re-)initializing the collective communicator..."
-                    )
-                    time.sleep(3)
-                else:
-                    self.logger.warning(
-                        "Failed to (re-)initializing the "
-                        "collective communicator"
-                    )
-                    return False
-            succeeded = self._broadcast_model_params()
-            if succeeded:
-                return self._calculate_grads_and_report_with_allreduce(grads)
-            else:
-                self.logger.warning("Failed to broadcast model parameters")
-                return False
-        else:
-            return True
-
-    def _collect_gradients_without_allreduce(self, grads):
+    def _collect_gradients_with_ps(self, grads):
         accepted, min_model_version = self.report_gradient(grads)
         if accepted and self._get_model_steps > 1:
             non_embed_vars_n = len(self._non_embed_vars)
@@ -815,20 +557,18 @@ class Worker(object):
         return accepted, min_model_version
 
     def _run_training_task(self, features, labels):
-        loss, grads = self.training_process(features, labels)
         if self._distribution_strategy == DistributionStrategy.ALLREDUCE:
-            # TODO: Delay certain amount of time before retrying
-            for _ in range(self._max_allreduce_retry_num + 1):
-                accepted = self._collect_gradients_with_allreduce_robust(grads)
-                if accepted:
-                    return accepted, None, loss
-                else:
-                    self.logger.warning(
-                        "Failed to perform allreduce operation on"
-                        "the gradients. Retrying..."
-                    )
+            (
+                version,
+                loss,
+            ) = self._allreduce_trainer.training_process_with_fault_tolerance(
+                features, labels
+            )
+            self._model_version = version
+            return True, version, loss
         else:
-            return (*self._collect_gradients_without_allreduce(grads), loss)
+            loss, grads = self.training_process(features, labels)
+            return (*self._collect_gradients_with_ps(grads), loss)
 
     def _collect_evaluation_result(self, outputs, labels):
         key = MetricsDictKey.MODEL_OUTPUT
@@ -946,11 +686,11 @@ class Worker(object):
                 err_msg = data_err_msg
                 break
         del eval_dataset
-        self.report_evaluation_metrics(
+        self._mc.report_evaluation_metrics(
             model_outputs=self._evaluation_result[MetricsDictKey.MODEL_OUTPUT],
             labels=self._evaluation_result[MetricsDictKey.LABEL],
         )
-        self.report_task_result(task_id, err_msg)
+        self._mc.report_task_result(task_id, err_msg)
         self._evaluation_result = {}
 
     def _process_train_end_callback_task_if_needed(self):
@@ -958,7 +698,11 @@ class Worker(object):
         if train_end_task:
             self._callbacks_list.on_train_end()
             self._task_data_service.clear_train_end_callback_task()
-            self.report_task_result(task_id=train_end_task.task_id, err_msg="")
+            self._mc.report_task_result(
+                task_id=train_end_task.task_id, err_msg=""
+            )
+        if self._distribution_strategy == DistributionStrategy.ALLREDUCE:
+            self._allreduce_trainer.export_saved_model(self._saved_model_path)
 
     def _process_minibatch_and_report(
         self,
@@ -1024,6 +768,8 @@ class Worker(object):
                 self._task_data_service.data_reader.metadata,
             )
             dataset = dataset.batch(self._minibatch_size).prefetch(1)
+            if self._allreduce_trainer:
+                self._allreduce_trainer.init_horovod_if_needed()
             self._timing.start_record_time("task_process")
             for dataset_batch in dataset:
                 if self._job_type == JobType.TRAINING_WITH_EVALUATION:
@@ -1066,6 +812,14 @@ class Worker(object):
                     self._timing.end_record_time("task_process")
                     self._timing.report_timing(reset=True)
                     self._timing.start_record_time("task_process")
+
+                if (
+                    self._allreduce_trainer
+                    and self._model_version % DEFAULT_STEPS_TO_CHECK_RENDEZVOUS
+                    == 0
+                ):
+                    self._allreduce_trainer.init_horovod_if_needed()
+
             del dataset
             # New evaluation tasks may be created after this worker's
             # training tasks are done, as other workers' may still
@@ -1084,7 +838,7 @@ class Worker(object):
         # variables of subclass models are not created.
         is_model_got = False
         while True:
-            task = self.get_task(elasticdl_pb2.EVALUATION)
+            task = self._mc.get_task(elasticdl_pb2.EVALUATION)
             # no evaluation task in eval_todo of master
             if not task.shard_name:
                 break

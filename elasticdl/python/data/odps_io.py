@@ -1,12 +1,21 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
-import queue
-import random
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor as Executor
 from multiprocessing import Process, Queue
 
-import numpy as np
 import odps
 from odps import ODPS
 from odps.models import Schema
@@ -15,12 +24,12 @@ from elasticdl.python.common.constants import MaxComputeConfig
 from elasticdl.python.common.log_utils import default_logger as logger
 
 
-def _nested_list_size(l):
+def _nested_list_size(nested_list):
     """
     Obtains the memory size for the nested list.
     """
-    total = sys.getsizeof(l)
-    for i in l:
+    total = sys.getsizeof(nested_list)
+    for i in nested_list:
         if isinstance(i, list):
             total += _nested_list_size(i)
         else:
@@ -82,6 +91,7 @@ class ODPSReader(object):
             access_key: ODPS user access key.
             endpoint: ODPS cluster endpoint.
             table: ODPS table name.
+            tunnel_endpoint: ODPS tunnel endpoint.
             partition: ODPS table's partition.
             options: Other options passed to ODPS context.
             num_processes: Number of parallel processes on this worker.
@@ -104,7 +114,7 @@ class ODPSReader(object):
         self._num_processes = num_processes
         _configure_odps_options(self._endpoint, options)
         self._odps_table = ODPS(
-            self._access_id, self._access_key, self._project, self._endpoint
+            self._access_id, self._access_key, self._project, self._endpoint,
         ).get_table(self._table)
 
         self._transform_fn = transform_fn
@@ -204,110 +214,6 @@ class ODPSReader(object):
             shard = self._shards[self._shard_idx]
             self._index_queues[worker_id].put(shard)
             self._shard_idx += 1
-
-    def to_iterator(
-        self,
-        num_workers,
-        worker_index,
-        batch_size,
-        epochs=1,
-        shuffle=False,
-        columns=None,
-        cache_batch_count=None,
-        limit=-1,
-    ):
-        """
-        Load slices of ODPS table (partition of table if `partition`
-        was specified) data with Python Generator.
-        Args:
-            num_workers: Total number of worker in the cluster.
-            worker_index: Current index of the worker in the cluster.
-            batch_size: Size of a slice.
-            epochs: Repeat the data for this many times.
-            shuffle: Whether to shuffle the data or rows.
-            columns: The list of columns to load. If `None`,
-                use all schema names of ODPS table.
-            cache_batch_count: The cache batch count.
-            limit: The limit for the table size to load.
-        """
-        if not worker_index < num_workers:
-            raise ValueError(
-                "index of worker should be less than number of worker"
-            )
-        if not batch_size > 0:
-            raise ValueError("batch_size should be positive")
-
-        table_size = self.get_table_size()
-        if 0 < limit < table_size:
-            table_size = limit
-        if columns is None:
-            columns = self._odps_table.schema.names
-
-        if cache_batch_count is None:
-            cache_batch_count = self._estimate_cache_batch_count(
-                columns=columns, table_size=table_size, batch_size=batch_size
-            )
-
-        large_batch_size = batch_size * cache_batch_count
-
-        overall_items = range(0, table_size, large_batch_size)
-
-        if len(overall_items) < num_workers:
-            overall_items = range(0, table_size, int(table_size / num_workers))
-
-        worker_items = list(
-            np.array_split(np.asarray(overall_items), num_workers)[
-                worker_index
-            ]
-        )
-        if shuffle:
-            random.shuffle(worker_items)
-        worker_items_with_epoch = worker_items * epochs
-
-        # `worker_items_with_epoch` is the total number of batches
-        # that needs to be read and the worker number should not
-        # be larger than `worker_items_with_epoch`
-        if self._num_processes is None:
-            self._num_processes = min(8, len(worker_items_with_epoch))
-        else:
-            self._num_processes = min(
-                self._num_processes, len(worker_items_with_epoch)
-            )
-
-        if self._num_processes == 0:
-            raise ValueError(
-                "Total worker number is 0. Please check if table has data."
-            )
-
-        with Executor(max_workers=self._num_processes) as executor:
-
-            futures = queue.Queue()
-            # Initialize concurrently running processes according
-            # to `num_processes`
-            for i in range(self._num_processes):
-                range_start = worker_items_with_epoch[i]
-                range_end = min(range_start + large_batch_size, table_size)
-                future = executor.submit(
-                    self.read_batch, range_start, range_end, columns
-                )
-                futures.put(future)
-
-            worker_items_index = self._num_processes
-
-            while not futures.empty():
-                if worker_items_index < len(worker_items_with_epoch):
-                    range_start = worker_items_with_epoch[worker_items_index]
-                    range_end = min(range_start + large_batch_size, table_size)
-                    future = executor.submit(
-                        self.read_batch, range_start, range_end, columns
-                    )
-                    futures.put(future)
-                    worker_items_index = worker_items_index + 1
-
-                head_future = futures.get()
-                records = head_future.result()
-                for i in range(0, len(records), batch_size):
-                    yield records[i : i + batch_size]  # noqa: E203
 
     def read_batch(self, start, end, columns=None, max_retries=3):
         """

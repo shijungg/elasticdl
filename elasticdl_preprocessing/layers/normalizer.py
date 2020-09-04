@@ -1,3 +1,16 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import tensorflow as tf
 
 
@@ -29,6 +42,10 @@ class Normalizer(tf.keras.layers.Layer):
         self.subtractor = subtractor
         self.divisor = divisor
 
+    def build(self, input_shape):
+        if self.divisor == 0:
+            raise ValueError("The divisor cannot be 0")
+
     def get_config(self):
         config = {"subtractor": self.subtractor, "divisor": self.divisor}
         base_config = super(Normalizer, self).get_config()
@@ -55,6 +72,7 @@ class Normalizer(tf.keras.layers.Layer):
         return normalized_tensor
 
     def _normalize_fn(self, x):
-        subtractor = tf.cast(self.subtractor, x.dtype)
-        divisor = tf.cast(self.divisor, x.dtype)
+        x = tf.cast(x, tf.float32)
+        subtractor = tf.cast(self.subtractor, tf.float32)
+        divisor = tf.cast(self.divisor, tf.float32)
         return (x - subtractor) / divisor

@@ -1,4 +1,18 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import unittest
+from unittest.mock import Mock
 
 import numpy as np
 import tensorflow as tf
@@ -89,10 +103,15 @@ class EvaluationServiceTest(unittest.TestCase):
 
         # Evaluation metrics will not be accepted if no evaluation ongoing
         evaluation_service = EvaluationService(
-            None, task_d, 10, 20, 0, False, _eval_metrics_fn,
+            None, task_d, 0, False, _eval_metrics_fn,
         )
 
-        _ = MasterServicer(2, task_d, evaluation_service=evaluation_service,)
+        master = Mock(
+            task_d=task_d, instance_manager=None, distribution_strategy=None,
+        )
+        _ = MasterServicer(
+            2, evaluation_service=evaluation_service, master=master
+        )
 
         # No checkpoint available
         self.assertFalse(evaluation_service.try_to_create_new_job())
@@ -113,11 +132,17 @@ class EvaluationServiceTest(unittest.TestCase):
         task_d = _TaskDispatcher({}, {"f1": (0, 10), "f2": (0, 10)}, {}, 3, 1)
 
         evaluation_service = EvaluationService(
-            None, task_d, 0, 0, 0, True, _eval_metrics_fn
+            None, task_d, 0, True, _eval_metrics_fn
         )
         task_d.set_evaluation_service(evaluation_service)
 
-        _ = MasterServicer(2, task_d, evaluation_service=evaluation_service,)
+        master = Mock(
+            task_d=task_d, instance_manager=None, distribution_strategy=None,
+        )
+
+        _ = MasterServicer(
+            2, evaluation_service=evaluation_service, master=master,
+        )
 
         self.assertEqual(8, len(task_d._eval_todo))
         for i in range(8):
@@ -135,38 +160,28 @@ class EvaluationServiceTest(unittest.TestCase):
         )
 
         evaluation_service = EvaluationService(
-            None, task_d, 10, 0, 10, False, _eval_metrics_fn,
+            None, task_d, 10, False, _eval_metrics_fn,
         )
 
         # Should add evaluation task and create eval job
-        evaluation_service.add_evaluation_task_if_needed(
-            master_locking=False, model_version=10
-        )
+        evaluation_service.add_evaluation_task_if_needed(model_version=10)
         self.assertTrue(evaluation_service._eval_job is not None)
         self.assertEqual(evaluation_service._eval_checkpoint_versions, [])
 
         # Should ignore because version 10 is in the eval list
-        evaluation_service.add_evaluation_task_if_needed(
-            master_locking=False, model_version=10
-        )
+        evaluation_service.add_evaluation_task_if_needed(model_version=10)
         self.assertEqual(evaluation_service._eval_checkpoint_versions, [])
 
         # Should append version 20 to the eval list
-        evaluation_service.add_evaluation_task_if_needed(
-            master_locking=False, model_version=20
-        )
+        evaluation_service.add_evaluation_task_if_needed(model_version=20)
         self.assertEqual(evaluation_service._eval_checkpoint_versions, [20])
 
         # Should ignore version 10 because version 20 is already in eval list
-        evaluation_service.add_evaluation_task_if_needed(
-            master_locking=False, model_version=10
-        )
+        evaluation_service.add_evaluation_task_if_needed(model_version=10)
         self.assertEqual(evaluation_service._eval_checkpoint_versions, [20])
 
         # Should append version 30 to the eval list
-        evaluation_service.add_evaluation_task_if_needed(
-            master_locking=False, model_version=30
-        )
+        evaluation_service.add_evaluation_task_if_needed(model_version=30)
         self.assertEqual(
             evaluation_service._eval_checkpoint_versions, [20, 30]
         )

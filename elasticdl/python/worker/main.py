@@ -1,18 +1,28 @@
-import time
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import grpc
 
 from elasticdl.python.common import log_utils
 from elasticdl.python.common.args import parse_worker_args
-from elasticdl.python.common.constants import DistributionStrategy
 from elasticdl.python.common.grpc_utils import build_channel
+from elasticdl.python.worker.master_client import MasterClient
+from elasticdl.python.worker.ps_client import PSClient
 from elasticdl.python.worker.worker import Worker
+from elasticdl_client.common.constants import DistributionStrategy
 
 CONNECT_PS_MAX_RETRIES = 3
 CONNECT_PS_TIMEOUT = 300
-# The number of seconds we wait for allreduce strategy's
-# FTLib consensus service to detect the worker pod
-_ALLREDUCE_STRATEGY_WARM_UP_SECS = 20
 
 
 def main():
@@ -22,10 +32,16 @@ def main():
     if args.master_addr is None:
         raise ValueError("master_addr is missing for worker")
 
-    master_channel = build_channel(args.master_addr)
+    master_client = MasterClient(
+        build_channel(args.master_addr), args.worker_id
+    )
 
-    ps_channels = []
-    if args.ps_addrs:
+    ps_client = None
+    if (
+        args.distribution_strategy == DistributionStrategy.PARAMETER_SERVER
+        and args.ps_addrs
+    ):
+        ps_channels = []
         ps_addrs = args.ps_addrs.split(",")
 
         for addr in ps_addrs:
@@ -55,18 +71,12 @@ def main():
                     "Time out to connect pod %s with 3 retries"
                     % addr.split(".")[0]
                 )
-
-    if args.distribution_strategy == DistributionStrategy.ALLREDUCE:
-        logger.info(
-            "Wait for %s seconds for FTLib consensus service to "
-            "detect the worker pod" % str(_ALLREDUCE_STRATEGY_WARM_UP_SECS)
-        )
-        time.sleep(_ALLREDUCE_STRATEGY_WARM_UP_SECS)
+        ps_client = PSClient(ps_channels)
 
     worker = Worker(
         args,
-        channel=master_channel,
-        ps_channels=ps_channels,
+        master_client=master_client,
+        ps_client=ps_client,
         set_parallelism=True,
     )
     worker.run()

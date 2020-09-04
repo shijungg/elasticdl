@@ -1,3 +1,16 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import unittest
 from threading import Thread
@@ -7,7 +20,6 @@ import tensorflow as tf
 
 from elasticdl.proto import elasticdl_pb2
 from elasticdl.python.common.args import parse_worker_args
-from elasticdl.python.common.constants import DistributionStrategy
 from elasticdl.python.common.hash_utils import int_to_id, string_to_id
 from elasticdl.python.common.model_utils import get_model_spec
 from elasticdl.python.ps.embedding_table import EmbeddingTable
@@ -17,7 +29,9 @@ from elasticdl.python.tests.test_utils import (
     get_mnist_dataset,
     get_random_batch,
 )
+from elasticdl.python.worker.ps_client import PSClient
 from elasticdl.python.worker.worker import Worker
+from elasticdl_client.common.constants import DistributionStrategy
 
 
 class WorkerPSInteractionTest(unittest.TestCase):
@@ -67,7 +81,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
                 DistributionStrategy.PARAMETER_SERVER,
             ]
             args = parse_worker_args(arguments)
-            worker = Worker(args, ps_channels=self._channels)
+            worker = Worker(args, ps_client=PSClient(self._channels))
             self._workers.append(worker)
 
     def _worker_train(
@@ -131,7 +145,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
             t.join()
 
     def test_worker_pull_embedding(self):
-        model_def = "mnist_functional_api.mnist_functional_api.custom_model"
+        model_def = "mnist.mnist_functional_api.custom_model"
         self._create_pserver(model_def, 2)
         arguments = [
             "--worker_id",
@@ -148,7 +162,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
             DistributionStrategy.PARAMETER_SERVER,
         ]
         args = parse_worker_args(arguments)
-        worker = Worker(args, ps_channels=self._channels)
+        worker = Worker(args, ps_client=PSClient(self._channels))
 
         # Test lookup embedding vectors that do not exist
         layers = ["test-2", "test-2-slot"]
@@ -167,7 +181,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
 
         result_dict = {}
         for layer in layers:
-            embedding = worker.pull_embedding_vectors(layer, ids)
+            embedding = worker._ps_client.pull_embedding_vectors(layer, ids)
             result_dict[layer] = embedding
 
         for layer in layers:
@@ -182,7 +196,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
             self.assertTrue(np.allclose(expected_result, result_dict[layer]))
 
     def test_compare_onebatch_train(self):
-        model_def = "mnist_functional_api.mnist_functional_api.custom_model"
+        model_def = "mnist.mnist_functional_api.custom_model"
         self._create_pserver(model_def, 2)
         images, labels = get_random_batch(self._batch_size)
         # TODO(yunjian.lmh): test optimizer wrapper
@@ -205,7 +219,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
         tf.keras.backend.clear_session()
         tf.random.set_seed(22)
 
-        worker = Worker(args, ps_channels=self._channels)
+        worker = Worker(args, ps_client=PSClient(self._channels))
         worker._run_model_call_before_training(images)
         worker.get_model()
         w_loss, w_grads = worker.training_process_eagerly(images, labels)
@@ -227,7 +241,6 @@ class WorkerPSInteractionTest(unittest.TestCase):
             model_zoo=self._model_zoo_path,
             model_def=model_def,
             dataset_fn="dataset_fn",
-            model_params=None,
             loss="loss",
             optimizer="optimizer",
             eval_metrics_fn="eval_metrics_fn",
@@ -251,7 +264,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
             np.testing.assert_array_equal(ps_v.numpy(), v.numpy())
 
     def test_compare_mnist_train(self):
-        model_def = "mnist_functional_api.mnist_functional_api.custom_model"
+        model_def = "mnist.mnist_functional_api.custom_model"
         self._create_pserver(model_def, 2)
         db, test_db = get_mnist_dataset(self._batch_size)
         stop_step = 20
@@ -279,7 +292,6 @@ class WorkerPSInteractionTest(unittest.TestCase):
             model_zoo=self._model_zoo_path,
             model_def=model_def,
             dataset_fn="dataset_fn",
-            model_params=None,
             loss="loss",
             optimizer="optimizer",
             eval_metrics_fn="eval_metrics_fn",
@@ -335,7 +347,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
         self._test_deepfm_train(num_ps, num_worker, stop_step)
 
     def test_restart_ps(self):
-        model_def = "mnist_functional_api.mnist_functional_api.custom_model"
+        model_def = "mnist.mnist_functional_api.custom_model"
         num_data = 8
         training_data = [
             get_random_batch(self._batch_size) for _ in range(num_data)
@@ -361,7 +373,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
             args = parse_worker_args(arguments)
             tf.keras.backend.clear_session()
             tf.random.set_seed(22)
-            worker = Worker(args, ps_channels=self._channels)
+            worker = Worker(args, ps_client=PSClient(self._channels))
             workers.append(worker)
             worker._run_model_call_before_training(training_data[0][0])
             for i in range(num_data):
@@ -374,7 +386,7 @@ class WorkerPSInteractionTest(unittest.TestCase):
                     # Restart ps for the 2nd worker at i==3
                     # self._restart_pserver(model_def)
                     self._reset_pserver()
-                    # `report_variable` will be called in `get_model` to
+                    # `push_dense_parameters` will be called in `get_model` to
                     # initialize variables on ps with worker variables
                     worker.get_model()
                     # send the grads again as these grads are not applied

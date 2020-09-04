@@ -1,11 +1,25 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import itertools
 import threading
 from collections import Counter
 
 from elasticdl.python.common import k8s_client as k8s
-from elasticdl.python.common.constants import BashCommandTemplate, PodStatus
+from elasticdl.python.common.constants import PodStatus
 from elasticdl.python.common.log_utils import default_logger as logger
+from elasticdl_client.common.constants import BashCommandTemplate
 
 _SERVICE_ADDR_SEP = ","
 
@@ -39,6 +53,7 @@ class InstanceManager(object):
     def __init__(
         self,
         task_d,
+        rendezvous_server=None,
         num_workers=1,
         worker_command=None,
         worker_args=None,
@@ -55,7 +70,6 @@ class InstanceManager(object):
         image_pull_policy=None,
         restart_policy="Never",
         envs=None,
-        expose_ports=False,
         disable_relaunch=False,
         log_file_path=None,
         **kwargs
@@ -68,7 +82,6 @@ class InstanceManager(object):
         self._worker_pod_priority = _parse_worker_pod_priority(
             self._num_workers, worker_pod_priority
         )
-        self._expose_ports = expose_ports
 
         self._num_ps = num_ps
         self._ps_command = ps_command
@@ -82,12 +95,13 @@ class InstanceManager(object):
         self._image_pull_policy = image_pull_policy
         self._envs = envs
         self._task_d = task_d
+        self._rendezvous_server = rendezvous_server
         self._next_worker_id = itertools.count().__next__
         self._log_file_path = log_file_path
 
         # Protects followed variables, which are accessed from event_cb.
         self._lock = threading.Lock()
-        # worker id to (pod name, phase) mapping
+        # worker id to (pod name, ip, phase) mapping
         # phase: None/Pending/Running/Succeeded/Failed/Unknown
         #   None: worker was just launched, haven't received event yet.
         #   Pending: worker pod not started yet
@@ -96,7 +110,7 @@ class InstanceManager(object):
         #       no issue.
         #   Failed: worker pod is killed for some reason
         #   Unknown: unknown
-        self._worker_pods_phase = {}
+        self._worker_pods_ip_phase = {}
         # pod name to worker id mapping
         self._worker_pod_name_to_id = {}
 
@@ -118,26 +132,20 @@ class InstanceManager(object):
         self._ps_addrs = self._get_addrs(
             self._num_ps, self._k8s_client.get_ps_service_address
         )
-        # TODO: Select a worker address to be used for broadcasting model
-        # parameters under allreduce-strategy.
-        self._worker_addrs = self._get_addrs(
-            self._num_workers, self._k8s_client.get_worker_service_address
-        )
-        if expose_ports:
-            self._worker_args += [
-                "--collective_communicator_service_name",
-                self._k8s_client.get_collective_communicator_service_name(),
-            ]
+        self._worker_addrs = []
 
     def _start_worker(self, worker_id):
         logger.info("Starting worker: %d" % worker_id)
         bash_command = self._worker_args[1]
         bash_command += " --worker_id {}".format(worker_id)
-        bash_command += " --ps_addrs {}".format(self._ps_addrs)
+        if self._ps_addrs:
+            bash_command += " --ps_addrs {}".format(self._ps_addrs)
         if self._log_file_path:
             bash_command += BashCommandTemplate.REDIRECTION.format(
                 self._log_file_path
             )
+        for extra_arg in self._worker_args[2:]:
+            bash_command += " {}".format(extra_arg)
         worker_args = [self._worker_args[0], bash_command]
         with self._lock:
             pod = self._k8s_client.create_worker(
@@ -153,12 +161,10 @@ class InstanceManager(object):
                 restart_policy=self._restart_policy,
                 ps_addrs=self._ps_addrs,
                 envs=copy.deepcopy(self._envs),
-                expose_ports=self._expose_ports,
             )
             name = pod.metadata.name
             self._worker_pod_name_to_id[name] = worker_id
-            self._worker_pods_phase[worker_id] = (name, None)
-            self._k8s_client.create_worker_service(worker_id)
+            self._worker_pods_ip_phase[worker_id] = (name, None, None)
 
     def _start_ps(self, ps_id):
         logger.info("Starting PS: %d" % ps_id)
@@ -181,7 +187,6 @@ class InstanceManager(object):
                 args=ps_args,
                 restart_policy=self._restart_policy,
                 envs=copy.deepcopy(self._envs),
-                expose_ports=False,
             )
             name = pod.metadata.name
             self._ps_pod_name_to_id[name] = ps_id
@@ -194,23 +199,6 @@ class InstanceManager(object):
             addrs.append(addr_get_fn(addr_id))
         return _SERVICE_ADDR_SEP.join(addrs)
 
-    @staticmethod
-    def _update_addr(old_addr, new_addr, addrs, addr_get_fn):
-        addrs_list = addrs.split(_SERVICE_ADDR_SEP)
-        addrs_list[addrs_list.index(addr_get_fn(old_addr))] = addr_get_fn(
-            new_addr
-        )
-        return _SERVICE_ADDR_SEP.join(addrs_list)
-
-    def _update_worker_addr(self, old_worker_id, new_worker_id):
-        new_addr = self._update_addr(
-            old_worker_id,
-            new_worker_id,
-            self._worker_addrs,
-            addr_get_fn=self._k8s_client.get_worker_service_address,
-        )
-        self._worker_addrs = new_addr
-
     def update_status(self, status):
         master_name = self._k8s_client.get_master_pod_name()
         self._k8s_client.patch_labels_to_pod(
@@ -221,9 +209,6 @@ class InstanceManager(object):
         for _ in range(self._num_workers):
             self._start_worker(self._next_worker_id())
 
-    def start_ftlib_consensus_service(self):
-        self._k8s_client.create_ftlib_consensus_service()
-
     def start_parameter_servers(self):
         for i in range(self._num_ps):
             self._start_ps(i)
@@ -231,7 +216,7 @@ class InstanceManager(object):
     def _remove_worker(self, worker_id):
         logger.info("Removing worker: %d", worker_id)
         with self._lock:
-            if worker_id not in self._worker_pods_phase:
+            if worker_id not in self._worker_pods_ip_phase:
                 logger.error("Unknown worker id: %s" % worker_id)
                 return
 
@@ -250,7 +235,7 @@ class InstanceManager(object):
     def stop_relaunch_and_remove_workers(self):
         with self._lock:
             self._relaunch_deleted_live_worker = False
-            for worker_id in self._worker_pods_phase:
+            for worker_id in self._worker_pods_ip_phase:
                 self._k8s_client.delete_worker(worker_id)
 
     def stop_relaunch_and_remove_all_ps(self):
@@ -261,7 +246,9 @@ class InstanceManager(object):
 
     def get_worker_counter(self):
         with self._lock:
-            return Counter([v for _, v in self._worker_pods_phase.values()])
+            return Counter(
+                [v for _, _, v in self._worker_pods_ip_phase.values()]
+            )
 
     def get_ps_counter(self):
         with self._lock:
@@ -279,6 +266,7 @@ class InstanceManager(object):
             return
 
         pod_name = evt_obj.metadata.name
+        pod_ip = evt_obj.status.pod_ip
         phase = evt_obj.status.phase
         if pod_name == self._k8s_client.get_master_pod_name():
             # No need to care about master pod
@@ -292,40 +280,47 @@ class InstanceManager(object):
             if pod_name in self._failed_pods:
                 return
 
-            # When a pod fails with exit_code == 137, it may be deleted,
-            # preempted, or OOMkilled. Master will try to relaunch it.
-            # For OOMkilled, the relaunch is a workaround for memory leak
-            # issues in tf eager mode.
             relaunch_failed_pod = False
-            if (
-                evt_type == "MODIFIED"
-                and phase == "Failed"
-                and evt_obj.status.container_statuses
-                and evt_obj.status.container_statuses[0].state.terminated
-                and evt_obj.status.container_statuses[
-                    0
-                ].state.terminated.exit_code
-                == 137
-            ):
+            if evt_type == "MODIFIED" and phase == "Failed":
                 self._failed_pods.append(pod_name)
-                relaunch_failed_pod = True
-                logger.info(
-                    "Pod %s is killed with reason %s."
-                    % (
-                        pod_name,
-                        evt_obj.status.container_statuses[
-                            0
-                        ].state.terminated.reason,
+                worker_id = self._worker_pod_name_to_id.get(pod_name, None)
+                if worker_id is not None:
+                    # Recover tasks when the worker failed
+                    self._task_d.recover_tasks(worker_id)
+
+                if (
+                    evt_obj.status.container_statuses
+                    and evt_obj.status.container_statuses[0].state.terminated
+                    and evt_obj.status.container_statuses[
+                        0
+                    ].state.terminated.exit_code
+                    == 137
+                    and evt_obj.status.container_statuses[
+                        0
+                    ].state.terminated.reason
+                    != "OOMKilled"
+                ):
+                    relaunch_failed_pod = True
+                    logger.info(
+                        "Pod %s is killed with reason %s."
+                        % (
+                            pod_name,
+                            evt_obj.status.container_statuses[
+                                0
+                            ].state.terminated.reason,
+                        )
                     )
-                )
 
             if pod_name in self._worker_pod_name_to_id:
                 worker_id = self._worker_pod_name_to_id.get(pod_name)
-                self._worker_pods_phase[worker_id] = (pod_name, phase)
+                self._worker_pods_ip_phase[worker_id] = (
+                    pod_name,
+                    pod_ip,
+                    phase,
+                )
                 if evt_type == "DELETED" or relaunch_failed_pod:
-                    del self._worker_pods_phase[worker_id]
+                    del self._worker_pods_ip_phase[worker_id]
                     del self._worker_pod_name_to_id[pod_name]
-                    self._task_d.recover_tasks(worker_id)
 
                     # If a deleted pod was not "Succeeded", relaunch a worker.
                     relaunch_worker = (
@@ -334,7 +329,11 @@ class InstanceManager(object):
                     )
                 else:
                     workers_failed = []
-                    for pod_name, phase in self._worker_pods_phase.values():
+                    for (
+                        pod_name,
+                        _,
+                        phase,
+                    ) in self._worker_pods_ip_phase.values():
                         workers_failed.append(phase == PodStatus.FAILED)
                     self.all_workers_failed = all(workers_failed)
 
@@ -357,14 +356,47 @@ class InstanceManager(object):
                     new_worker_id
                 ] = self._worker_pod_priority[worker_id]
             self._start_worker(new_worker_id)
-            with self._lock:
-                self._update_worker_addr(worker_id, new_worker_id)
         elif relaunch_ps:
             logger.info("Relaunching ps.")
             # Note: the ID and service address for relaunched parameter
             # server are intentionally left unchanged to support fault
             # tolerance.
             self._start_ps(ps_id)
+
+        if self._rendezvous_server:
+            self._worker_addrs = self._get_alive_worker_addr()
+            self._rendezvous_server.set_worker_hosts(self._worker_addrs)
+
+    def get_alive_workers(self):
+        alive_workers = []
+        for pod_name, _, phase in self._worker_pods_ip_phase.values():
+            if phase == PodStatus.RUNNING:
+                alive_workers.append(pod_name)
+        return alive_workers
+
+    def get_worker_pod_ip(self, worker_id):
+        if worker_id not in self._worker_pods_ip_phase:
+            return None
+        _, pod_ip, _ = self._worker_pods_ip_phase[worker_id]
+        return pod_ip
+
+    def _get_alive_worker_addr(self):
+        alive_workers = self.get_alive_workers()
+        worker_addrs = []
+        worker_start_times = []
+        for pod_name in alive_workers:
+            pod = self._k8s_client.get_pod(pod_name)
+            worker_start_times.append(pod.status.start_time)
+            worker_id = self._worker_pod_name_to_id[pod_name]
+            pod_ip = self.get_worker_pod_ip(worker_id)
+            worker_addrs.append(pod_ip)
+
+        # Sort worker addrs by start time. Then the master will assign
+        # the rank according to the order in addrs list.
+        worker_addrs = [
+            x for _, x in sorted(zip(worker_start_times, worker_addrs))
+        ]
+        return worker_addrs
 
     @property
     def ps_addrs(self):

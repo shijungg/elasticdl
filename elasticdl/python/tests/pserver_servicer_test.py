@@ -1,7 +1,21 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import tempfile
 import unittest
 
+import grpc
 import numpy as np
 import tensorflow as tf
 from google.protobuf import empty_pb2
@@ -14,6 +28,7 @@ from elasticdl.python.common.model_utils import (
 )
 from elasticdl.python.common.save_utils import CheckpointSaver
 from elasticdl.python.common.tensor_utils import (
+    Tensor,
     pb_to_ndarray,
     serialize_indexed_slices,
     serialize_ndarray,
@@ -66,6 +81,7 @@ class PserverServicerTest(unittest.TestCase):
         self._parameters = pserver.parameters
         self._server = pserver.server
         self._stub = elasticdl_pb2_grpc.PserverStub(self._channel)
+        grpc.channel_ready_future(self._channel).result()
 
         self._lr = 0.1
 
@@ -262,17 +278,15 @@ class PserverServicerTest(unittest.TestCase):
         self.embedding_table = (
             np.random.rand(4 * dim).reshape((4, dim)).astype(np.float32)
         )
-        self.embedding_grads0 = tf.IndexedSlices(
-            values=np.random.rand(3 * dim)
-            .reshape((3, dim))
-            .astype(np.float32),
-            indices=(3, 1, 3),
+        self.embedding_grads0 = Tensor(
+            None,
+            np.random.rand(3 * dim).reshape((3, dim)).astype(np.float32),
+            np.asarray([3, 1, 3]),
         )
-        self.embedding_grads1 = tf.IndexedSlices(
-            values=np.random.rand(3 * dim)
-            .reshape((3, dim))
-            .astype(np.float32),
-            indices=(2, 2, 3),
+        self.embedding_grads1 = Tensor(
+            None,
+            np.random.rand(3 * dim).reshape((3, dim)).astype(np.float32),
+            np.asarray([2, 2, 3]),
         )
         push_model_req = elasticdl_pb2.Model()
         push_model_req.version = self._parameters.version

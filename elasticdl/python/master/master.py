@@ -1,3 +1,16 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import threading
 import time
@@ -7,15 +20,9 @@ import grpc
 from kubernetes.client import V1EnvVar
 
 from elasticdl.proto import elasticdl_pb2, elasticdl_pb2_grpc
-from elasticdl.python.common.args import (
-    build_arguments_from_parsed_result,
-    parse_envs,
-    wrap_go_args_with_string,
-    wrap_python_args_with_string,
-)
+from elasticdl.python.common.args import wrap_go_args_with_string
 from elasticdl.python.common.constants import (
     GRPC,
-    DistributionStrategy,
     InstanceManagerStatus,
     JobType,
 )
@@ -35,9 +42,20 @@ from elasticdl.python.data.reader.data_reader_factory import create_data_reader
 from elasticdl.python.elasticdl.callbacks import MaxStepsStopping
 from elasticdl.python.master.evaluation_service import EvaluationService
 from elasticdl.python.master.k8s_instance_manager import InstanceManager
+from elasticdl.python.master.rendezvous_server import HorovodRendezvousServer
 from elasticdl.python.master.servicer import MasterServicer
 from elasticdl.python.master.task_dispatcher import _TaskDispatcher
 from elasticdl.python.master.tensorboard_service import TensorboardService
+from elasticdl_client.common.args import (
+    build_arguments_from_parsed_result,
+    parse_envs,
+    wrap_python_args_with_string,
+)
+from elasticdl_client.common.constants import (
+    BashCommandTemplate,
+    ClusterSpecConfig,
+    DistributionStrategy,
+)
 
 
 def _make_task_dispatcher(
@@ -88,6 +106,9 @@ class Master(object):
         master_ip = os.getenv("MY_POD_IP", "localhost")
         self.master_addr = "%s:%d" % (master_ip, args.port)
         self.job_type = Master._get_job_type(args)
+        self.rendezvous_server = None
+        if self.distribution_strategy == DistributionStrategy.ALLREDUCE:
+            self.rendezvous_server = HorovodRendezvousServer(master_ip)
 
         # Initialize TensorBoard service if requested
         self.tb_service = self._create_tensorboard_service(
@@ -105,7 +126,7 @@ class Master(object):
             get_module_file_path(args.model_zoo, args.model_def)
         ).__dict__
         self.model_inst = load_model_from_module(
-            args.model_def, self.model_module, args.model_params
+            args.model_def, self.model_module
         )
         self.optimizer = self.model_module[args.optimizer]()
         self._create_data_reader_fn = create_data_reader
@@ -143,11 +164,11 @@ class Master(object):
         self.task_d.add_deferred_callback_create_train_end_task()
         self.evaluation_service = self._create_evaluation_service(args)
 
-        # Initialize master service
-        self.master_servicer, self.server = self._create_master_service(args)
-
         # Initialize instance manager
         self.instance_manager = self._create_instance_manager(args)
+
+        # Initialize master service
+        self.master_servicer, self.server = self._create_master_service(args)
 
         self._should_stop = False
         self._exit_code = 0
@@ -187,12 +208,6 @@ class Master(object):
         """
         Start the components one by one. Make sure that it is ready to run.
         """
-        # Start the evaluation service if requested
-        if self.evaluation_service:
-            self.logger.info("Starting evaluation service")
-            self.evaluation_service.start()
-            self.logger.info("Evaluation service started")
-
         # Start the master GRPC server
         self.logger.info("Starting master RPC server")
         self.server.start()
@@ -202,8 +217,8 @@ class Master(object):
         if self.instance_manager:
             self.instance_manager.update_status(InstanceManagerStatus.PENDING)
             if self.distribution_strategy == DistributionStrategy.ALLREDUCE:
-                # Exposes the consensus service for allreduce-based training
-                self.instance_manager.start_ftlib_consensus_service()
+                # Start rendezvous server for workers to initialize Horovod
+                self.rendezvous_server.start()
             else:
                 self.instance_manager.start_parameter_servers()
             self.instance_manager.start_workers()
@@ -250,11 +265,6 @@ class Master(object):
         """
         self.logger.info("Stopping master")
 
-        if self.evaluation_service:
-            self.logger.info("Stopping evaluation service")
-            self.evaluation_service.stop()
-            self.logger.info("Evaluation service stopped")
-
         self.logger.info("Stopping RPC server")
         self.server.stop(None)  # grace = None
         self.logger.info("RPC server stopped")
@@ -278,11 +288,7 @@ class Master(object):
     @staticmethod
     def _get_job_type(args):
         if all(
-            (
-                args.training_data,
-                args.validation_data,
-                args.evaluation_throttle_secs or args.evaluation_steps,
-            )
+            (args.training_data, args.validation_data, args.evaluation_steps,)
         ):
             job_type = JobType.TRAINING_WITH_EVALUATION
         elif all(
@@ -325,16 +331,12 @@ class Master(object):
             or self.job_type == JobType.EVALUATION_ONLY
         ):
             self.logger.info(
-                "Creating evaluation service with throttle seconds %d "
-                " and evaluation steps %d",
-                args.evaluation_throttle_secs,
+                "Creating evaluation service with " "evaluation steps %d",
                 args.evaluation_steps,
             )
             evaluation_service = EvaluationService(
                 self.tb_service,
                 self.task_d,
-                args.evaluation_start_delay_secs,
-                args.evaluation_throttle_secs,
                 args.evaluation_steps,
                 self.job_type == JobType.EVALUATION_ONLY,
                 self.model_module[args.eval_metrics_fn],
@@ -357,8 +359,8 @@ class Master(object):
         )
         master_servicer = MasterServicer(
             args.minibatch_size,
-            self.task_d,
             evaluation_service=self.evaluation_service,
+            master=self,
         )
         elasticdl_pb2_grpc.add_MasterServicer_to_server(
             master_servicer, server
@@ -375,22 +377,26 @@ class Master(object):
         if args.num_workers:
             assert args.worker_image, "Worker image cannot be empty"
 
-            worker_client_command = "python -m elasticdl.python.worker.main"
+            worker_client_command = (
+                BashCommandTemplate.SET_PIPEFAIL
+                + " python -m elasticdl.python.worker.main"
+            )
             worker_args = [
                 "--master_addr",
                 self.master_addr,
                 "--job_type",
                 self.job_type,
             ]
-            worker_args.extend(build_arguments_from_parsed_result(args))
+            worker_args.extend(
+                build_arguments_from_parsed_result(args, filter_args=["envs"])
+            )
             worker_args = wrap_python_args_with_string(worker_args)
             worker_args.insert(0, worker_client_command)
 
             if args.use_go_ps:
                 opt_type, opt_args = get_optimizer_info(self.optimizer)
-                # TODO: rename the Go PS executable using a meaningful filename
-                ps_client_command = "main"
-                ps_args = [
+                ps_command = "elasticdl_ps"
+                ps_command_args = [
                     "-job_name=" + args.job_name,
                     "-namespace=" + args.namespace,
                     "-master_addr=" + self.master_addr,
@@ -412,11 +418,22 @@ class Master(object):
                     "-opt_type=" + opt_type,
                     "-opt_args=" + opt_args,
                 ]
-                ps_args = wrap_go_args_with_string(ps_args)
-                ps_args.insert(0, ps_client_command)
-            else:
-                ps_client_command = "python -m elasticdl.python.ps.main"
+                ps_command_args = wrap_go_args_with_string(ps_command_args)
+                # Execute source /root/.bashrc to add the file path
+                # of `elasticdl_ps` into the PATH environment variable.
                 ps_args = [
+                    "source",
+                    "/root/.bashrc_elasticdl",
+                    "&&",
+                    ps_command,
+                ]
+                ps_args.extend(ps_command_args)
+            else:
+                ps_command = (
+                    BashCommandTemplate.SET_PIPEFAIL
+                    + " python -m elasticdl.python.ps.main"
+                )
+                ps_command_args = [
                     "--grads_to_wait",
                     str(args.grads_to_wait),
                     "--lr_staleness_modulation",
@@ -458,8 +475,8 @@ class Master(object):
                     "--num_minibatches_per_task",
                     str(args.num_minibatches_per_task),
                 ]
-                ps_args = wrap_python_args_with_string(ps_args)
-                ps_args.insert(0, ps_client_command)
+                ps_args = wrap_python_args_with_string(ps_command_args)
+                ps_args.insert(0, ps_command)
 
             worker_args = ["-c", " ".join(worker_args)]
             ps_args = ["-c", " ".join(ps_args)]
@@ -471,9 +488,11 @@ class Master(object):
 
             kwargs = get_dict_from_params_str(args.aux_params)
             disable_relaunch = kwargs.get("disable_relaunch", False)
+            cluster_spec = self._get_image_cluster_spec(args.cluster_spec)
 
             instance_manager = InstanceManager(
                 self.task_d,
+                rendezvous_server=self.rendezvous_server,
                 job_name=args.job_name,
                 image_name=args.worker_image,
                 worker_command=container_command,
@@ -492,15 +511,22 @@ class Master(object):
                 volume=args.volume,
                 image_pull_policy=args.image_pull_policy,
                 restart_policy=args.restart_policy,
-                cluster_spec=args.cluster_spec,
+                cluster_spec=cluster_spec,
                 envs=env,
-                expose_ports=self.distribution_strategy
-                == DistributionStrategy.ALLREDUCE,
                 disable_relaunch=disable_relaunch,
                 log_file_path=args.log_file_path,
             )
 
         return instance_manager
+
+    def _get_image_cluster_spec(self, cluster_spec):
+        if cluster_spec:
+            filename = os.path.basename(cluster_spec)
+            image_cluster_spec = os.path.join(
+                ClusterSpecConfig.CLUSTER_SPEC_DIR, filename
+            )
+            return image_cluster_spec
+        return cluster_spec
 
     def _check_timeout_tasks(self):
         while True:

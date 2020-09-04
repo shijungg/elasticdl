@@ -1,3 +1,16 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import random
 import time
@@ -13,14 +26,14 @@ class InstanceManagerTest(unittest.TestCase):
         os.environ.get("K8S_TESTS", "True") == "False",
         "No Kubernetes cluster available",
     )
-    def testCreateDeleteWorkerPod(self):
+    def test_create_delete_worker_pod(self):
         task_d = _TaskDispatcher({"f": (0, 10)}, {}, {}, 1, 1)
         task_d.recover_tasks = MagicMock()
         instance_manager = InstanceManager(
             task_d,
             job_name="test-create-worker-pod-%d-%d"
             % (int(time.time()), random.randint(1, 101)),
-            image_name="gcr.io/google-samples/hello-app:1.0",
+            image_name="ubuntu:18.04",
             worker_command=["/bin/bash"],
             worker_args=["-c", "echo"],
             namespace="default",
@@ -41,15 +54,41 @@ class InstanceManagerTest(unittest.TestCase):
             counters = instance_manager.get_worker_counter()
             if not counters:
                 break
-        task_d.recover_tasks.assert_has_calls(
-            [call(0), call(1), call(2)], any_order=True
-        )
+        self.assertFalse(counters)
 
     @unittest.skipIf(
         os.environ.get("K8S_TESTS", "True") == "False",
         "No Kubernetes cluster available",
     )
-    def testFailedWorkerPod(self):
+    def test_get_worker_addrs(self):
+        task_d = _TaskDispatcher({"f": (0, 10)}, {}, {}, 1, 1)
+        instance_manager = InstanceManager(
+            task_d,
+            job_name="test-create-worker-pod-%d-%d"
+            % (int(time.time()), random.randint(1, 101)),
+            image_name="ubuntu:18.04",
+            worker_command=["/bin/bash"],
+            worker_args=["-c", "sleep 5 #"],
+            namespace="default",
+            num_workers=3,
+        )
+
+        instance_manager.start_workers()
+        max_check_num = 20
+        for _ in range(max_check_num):
+            time.sleep(3)
+            counters = instance_manager.get_worker_counter()
+            if counters["Running"]:
+                worker_addrs = instance_manager._get_alive_worker_addr()
+                self.assertEqual(len(worker_addrs), counters["Running"])
+
+        instance_manager.stop_relaunch_and_remove_workers()
+
+    @unittest.skipIf(
+        os.environ.get("K8S_TESTS", "True") == "False",
+        "No Kubernetes cluster available",
+    )
+    def test_failed_worker_pod(self):
         """
         Start a pod running a python program destined to fail with
         restart_policy="Never" to test failed_worker_count
@@ -60,7 +99,7 @@ class InstanceManagerTest(unittest.TestCase):
             task_d,
             job_name="test-failed-worker-pod-%d-%d"
             % (int(time.time()), random.randint(1, 101)),
-            image_name="gcr.io/google-samples/hello-app:1.0",
+            image_name="ubuntu:18.04",
             worker_command=["/bin/bash"],
             worker_args=["-c", "badcommand"],
             namespace="default",
@@ -89,16 +128,16 @@ class InstanceManagerTest(unittest.TestCase):
         os.environ.get("K8S_TESTS", "True") == "False",
         "No Kubernetes cluster available",
     )
-    def testRelaunchWorkerPod(self):
+    def test_relaunch_worker_pod(self):
         num_workers = 3
         task_d = _TaskDispatcher({"f": (0, 10)}, {}, {}, 1, 1)
         instance_manager = InstanceManager(
             task_d,
             job_name="test-relaunch-worker-pod-%d-%d"
             % (int(time.time()), random.randint(1, 101)),
-            image_name="gcr.io/google-samples/hello-app:1.0",
+            image_name="ubuntu:18.04",
             worker_command=["/bin/bash"],
-            worker_args=["-c", "sleep 10"],
+            worker_args=["-c", "sleep 10 #"],
             namespace="default",
             num_workers=num_workers,
         )
@@ -116,7 +155,10 @@ class InstanceManagerTest(unittest.TestCase):
         current_workers = set()
         live_workers = set()
         with instance_manager._lock:
-            for k, (_, phase) in instance_manager._worker_pods_phase.items():
+            for (
+                k,
+                (_, _, phase),
+            ) in instance_manager._worker_pods_ip_phase.items():
                 current_workers.add(k)
                 if phase in ["Running", "Pending"]:
                     live_workers.add(k)
@@ -130,7 +172,7 @@ class InstanceManagerTest(unittest.TestCase):
                 break
             time.sleep(1)
             with instance_manager._lock:
-                for k in instance_manager._worker_pods_phase:
+                for k in instance_manager._worker_pods_ip_phase:
                     if k not in range(num_workers, num_workers * 2):
                         found = True
         else:
@@ -142,15 +184,15 @@ class InstanceManagerTest(unittest.TestCase):
         os.environ.get("K8S_TESTS", "True") == "False",
         "No Kubernetes cluster available",
     )
-    def testRelaunchPsPod(self):
+    def test_relaunch_ps_pod(self):
         num_ps = 3
         instance_manager = InstanceManager(
             task_d=None,
             job_name="test-relaunch-ps-pod-%d-%d"
             % (int(time.time()), random.randint(1, 101)),
-            image_name="gcr.io/google-samples/hello-app:1.0",
+            image_name="ubuntu:18.04",
             ps_command=["/bin/bash"],
-            ps_args=["-c", "sleep 10"],
+            ps_args=["-c", "sleep 10 #"],
             namespace="default",
             num_ps=num_ps,
         )

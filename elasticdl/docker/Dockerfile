@@ -1,30 +1,62 @@
-ARG BASE_IMAGE=tensorflow/tensorflow:2.1.0-py3
-# Use tensorflow/tensorflow:2.1.0-gpu-py3 if you want GPU-support.
+# To build Docker images, please refer to scripts/travis/build_images.sh.
+ARG BASE_IMAGE
 
-# Multi-stage is used for dev/ci/release images
-# Better to build in DOCKER_BUILDKIT by setting env: DOCKER_BUILDKIT=1
-# To build dev:
-# docker build --target dev -t dev_image_name -f this_dockerfile elasticdl_repo_dir
-# To build ci:
-# docker build --target ci -t ci_image_name -f this_dockerfile elasticdl_repo_dir
-# To build release:
-# docker -t image_name -f this_dockerfile elasticdl_repo_dir
-
-# Stage 1: dev
 FROM ${BASE_IMAGE} as dev
 ARG EXTRA_PYPI_INDEX=https://pypi.org/simple
 
-RUN apt update && \
-    apt install -y unzip curl git software-properties-common g++ wget \
-    libeigen3-dev
+COPY elasticdl/docker/bashrc /etc/bash.bashrc
+RUN chmod a+rx /etc/bash.bashrc
+
+RUN apt-get -qq update && apt-get -qq install -y \
+        unzip \
+        curl \
+        git \
+        software-properties-common \
+        g++ \
+        wget \
+        build-essential \
+        cmake \
+        vim \
+        ca-certificates \
+        libjpeg-dev \
+        libpng-dev \
+        librdmacm1 \
+        libibverbs1 \
+        ibverbs-providers \
+        shellcheck \
+        libeigen3-dev \
+        clang-format > /dev/null && \
+        python -m pip install --quiet --upgrade pip
+
+COPY elasticdl_client/requirements.txt /requirements.txt
+RUN python -m pip install --quiet -r /requirements.txt \
+        --extra-index-url=$EXTRA_PYPI_INDEX \
+        && rm /requirements.txt
+
+COPY elasticdl_preprocessing/requirements.txt /requirements.txt
+RUN python -m pip install --quiet -r /requirements.txt \
+        --extra-index-url=$EXTRA_PYPI_INDEX \
+        && rm /requirements.txt
+
+COPY elasticdl_preprocessing/requirements-dev.txt /requirements-dev.txt
+RUN python -m pip install --quiet -r /requirements-dev.txt \
+        --extra-index-url=$EXTRA_PYPI_INDEX \
+        && rm /requirements-dev.txt
 
 COPY elasticdl/requirements.txt /requirements.txt
-RUN pip install -r /requirements.txt --extra-index-url=${EXTRA_PYPI_INDEX} && rm /requirements.txt
+RUN python -m pip install --quiet -r /requirements.txt \
+        --extra-index-url=$EXTRA_PYPI_INDEX \
+        && rm /requirements.txt
+
 COPY elasticdl/requirements-dev.txt /requirements-dev.txt
-RUN pip install -r /requirements-dev.txt --extra-index-url=${EXTRA_PYPI_INDEX} && rm /requirements-dev.txt
+RUN python -m pip install --quiet -r /requirements-dev.txt \
+        --extra-index-url=$EXTRA_PYPI_INDEX \
+        && rm /requirements-dev.txt
 
 ENV TF_PATH /tmp/tensorflow
-RUN cd /tmp && git clone --depth=1 --branch v2.2.0-rc0 https://github.com/tensorflow/tensorflow.git
+RUN cd /tmp \
+        && git clone --depth=1 --branch v2.2.0-rc0 \
+        https://github.com/tensorflow/tensorflow
 
 # Install Go and related tools
 ARG GO_MIRROR_URL=https://dl.google.com/go
@@ -37,70 +69,40 @@ RUN /install-go.bash ${GO_MIRROR_URL} && rm /install-go.bash
 COPY elasticdl/docker/scripts/install-protobuf.bash /
 RUN /install-protobuf.bash && rm /install-protobuf.bash
 
-# Install elasticdl.org/elasticdl Go package
-ENV ELASTICDLPATH /root/elasticdl
-COPY . /elasticdl
-RUN cd /elasticdl && \
-    make -f elasticdl/Makefile && \
-    cp -r /elasticdl/elasticdl/pkg $ELASTICDLPATH && \
-    cd $GOPATH/pkg/mod/github.com/tensorflow && \
-    go mod init github.com/tensorflow &&\
-    cd $ELASTICDLPATH && \
-    go mod init elasticdl.org/elasticdl && \
-    go mod edit -replace github.com/tensorflow=${GOPATH}/pkg/mod/github.com/tensorflow && \
-    go get k8s.io/client-go@v0.17.0 && \
-    go mod tidy && \
-    go install ./... 
+# Copy gen_dataset.sh
+COPY scripts/gen_dataset.sh /scripts/gen_dataset.sh
+COPY elasticdl/python/data/recordio_gen/image_label.py /scripts/image_label.py
+COPY elasticdl/python/data/recordio_gen/frappe_recordio_gen.py /scripts/frappe_recordio_gen.py
+COPY elasticdl/python/data/recordio_gen/heart_recordio_gen.py /scripts/heart_recordio_gen.py
 
-# Create elasticdl package
-RUN cd /elasticdl && \
-    python setup.py bdist_wheel && \
-    cp dist/elasticdl-develop-py3-none-any.whl / 
+FROM dev as allreduce
 
+# TODO: We should use a tag or branch name after Horovod releases
+# elastic training codes.
+ARG HOROVOD_COMMIT_ID="3108a24"
 
-# Stage 2: ci
-FROM dev as ci
+RUN pip install future typing
 
-# This assumes that the data generation package is independent with the
-# rest part of ElasticDL.  The generated data will be in /data.
-COPY elasticdl/python/data/recordio_gen/image_label.py /var/image_label.py
-RUN python /var/image_label.py --dataset mnist --fraction 0.15 \
-        --records_per_shard 4096 /data
+# Note that pip is having issue downloading PyTorch on manylinux so we use curl
+# to download it instead
+RUN curl -sLo torch-1.4.0-cp36-cp36m-manylinux1_x86_64.whl \
+        https://files.pythonhosted.org/packages/24/19/4804aea17cd136f1705a5e98a00618cb8f6ccc375ad8bfa437408e09d058/torch-1.4.0-cp36-cp36m-manylinux1_x86_64.whl
+RUN python -m pip install --quiet torch-1.4.0-cp36-cp36m-manylinux1_x86_64.whl \
+        && rm torch-1.4.0-cp36-cp36m-manylinux1_x86_64.whl
 
-# Copy frappe dataset
-COPY elasticdl/python/data/recordio_gen/frappe_recordio_gen.py /var/frappe_recordio_gen.py
-RUN python /var/frappe_recordio_gen.py --data /root/.keras/datasets --output_dir /data/frappe \
-    --fraction 0.05
-# Copy heart dataset
-COPY elasticdl/python/data/recordio_gen/heart_recordio_gen.py /var/heart_recordio_gen.py
-RUN python /var/heart_recordio_gen.py --data_dir /root/.keras/datasets --output_dir /data/heart
+# The latest package of Horovod does not support elastic training,
+# so we need to git clone and install it using source codes.
+ENV HOROVOD_PATH /tmp/horovod
+RUN cd /tmp \
+        && git clone -n https://github.com/horovod/horovod.git \
+        && cd horovod \
+        && git checkout ${HOROVOD_COMMIT_ID} \
+        && git submodule update --init --recursive
 
-RUN rm -rf /root/.keras/datasets
+RUN cd ${HOROVOD_PATH} && HOROVOD_WITHOUT_MPI=1 \
+        HOROVOD_WITHOUT_MXNET=1 \
+        HOROVOD_WITH_TENSORFLOW=1 \
+        HOROVOD_WITH_PYTORCH=1  \
+        python setup.py install
 
-WORKDIR /
-ENV PYTHONPATH=/elasticdl
-COPY setup.py /elasticdl/setup.py
-RUN cd /elasticdl && python setup.py install
-COPY model_zoo /model_zoo
-
-
-# Stage 3: release
-FROM ${BASE_IMAGE} as release
-ARG EXTRA_PYPI_INDEX=https://pypi.org/simple
-
-# Replace the Splash screen from TensorFlow image.
-COPY elasticdl/docker/bashrc /etc/bash.bashrc
-RUN chmod a+rwx /etc/bash.bashrc
-
-# Copy GO PS
-ARG GO_PS=/root/go/bin/main
-RUN mkdir -p /usr/local/go/bin
-COPY --from=dev ${GO_PS} /usr/local/go/bin
-ENV PATH /usr/local/go/bin:$PATH
-
-WORKDIR /
-
-# Install elasticdl package
-COPY --from=dev /elasticdl-develop-py3-none-any.whl /
-RUN pip install /elasticdl-develop-py3-none-any.whl --extra-index-url=${EXTRA_PYPI_INDEX} &&  \
-    rm /elasticdl-develop-py3-none-any.whl
+RUN rm -rf $HOROVOD_PATH

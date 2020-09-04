@@ -1,10 +1,22 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import sys
 from collections import namedtuple
 
 import tensorflow as tf
 
-from elasticdl.python.common.args import parse_envs
 from elasticdl.python.common.constants import MetricsDictKey
 from elasticdl.python.common.evaluation_utils import EvaluationMetrics
 from elasticdl.python.common.log_utils import default_logger as logger
@@ -16,6 +28,7 @@ from elasticdl.python.data.reader.csv_reader import CSVDataReader
 from elasticdl.python.data.reader.data_reader_factory import create_data_reader
 from elasticdl.python.data.reader.odps_reader import ODPSDataReader
 from elasticdl.python.data.reader.recordio_reader import RecordIODataReader
+from elasticdl_client.common.args import parse_envs
 
 _MockedTask = namedtuple("Task", ["shard_name", "start", "end"])
 
@@ -45,7 +58,6 @@ class LocalExecutor:
             loss=args.loss,
             optimizer=args.optimizer,
             eval_metrics_fn=args.eval_metrics_fn,
-            model_params=args.model_params,
             prediction_outputs_processor="",
             custom_data_reader=args.custom_data_reader,
             callbacks=args.callbacks,

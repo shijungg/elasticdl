@@ -1,10 +1,25 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import random
 import unittest
 from collections import defaultdict
+from unittest.mock import MagicMock, Mock
 
 import tensorflow as tf
 
 from elasticdl.proto import elasticdl_pb2
+from elasticdl.python.master.rendezvous_server import HorovodRendezvousServer
 from elasticdl.python.master.servicer import MasterServicer
 from elasticdl.python.master.task_dispatcher import _TaskDispatcher
 
@@ -37,35 +52,41 @@ class SimpleModel(tf.keras.Model):
 
 
 class ServicerTest(unittest.TestCase):
-    def testGetEmptyTask(self):
-        master = MasterServicer(
-            3,
-            _TaskDispatcher({}, {}, {}, records_per_task=3, num_epochs=2),
-            evaluation_service=None,
+    def setUp(self):
+        self.master = Mock(
+            task_d=None, instance_manager=None, distribution_strategy=None,
+        )
+
+    def test_get_empty_task(self):
+        self.master.task_d = _TaskDispatcher(
+            {}, {}, {}, records_per_task=3, num_epochs=2
+        )
+        master_servicer = MasterServicer(
+            3, evaluation_service=None, master=self.master,
         )
 
         req = elasticdl_pb2.GetTaskRequest()
 
         # No task yet, make sure the returned versions are as expected.
         req.worker_id = 1
-        task = master.get_task(req, None)
+        task = master_servicer.get_task(req, None)
         self.assertEqual("", task.shard_name)
         self.assertEqual(0, task.model_version)
 
-        master._version = 1
-        task = master.get_task(req, None)
+        master_servicer._version = 1
+        task = master_servicer.get_task(req, None)
         self.assertEqual("", task.shard_name)
         self.assertEqual(1, task.model_version)
 
-    def testReportTaskResult(self):
-        task_d = _TaskDispatcher(
+    def test_report_task_result(self):
+        self.master.task_d = _TaskDispatcher(
             {"shard_1": (0, 10), "shard_2": (0, 9)},
             {},
             {},
             records_per_task=3,
             num_epochs=2,
         )
-        master = MasterServicer(3, task_d, evaluation_service=None,)
+        master = MasterServicer(3, evaluation_service=None, master=self.master)
 
         # task to number of runs.
         tasks = defaultdict(int)
@@ -75,7 +96,9 @@ class ServicerTest(unittest.TestCase):
             task = master.get_task(req, None)
             if not task.shard_name:
                 break
-            self.assertEqual(task_d._doing[task.task_id][0], req.worker_id)
+            self.assertEqual(
+                self.master.task_d._doing[task.task_id][0], req.worker_id
+            )
             task_key = (task.shard_name, task.start, task.end)
             tasks[task_key] += 1
             report = elasticdl_pb2.ReportTaskResultRequest()
@@ -97,6 +120,30 @@ class ServicerTest(unittest.TestCase):
             },
             tasks,
         )
+
+    def test_get_comm_rank(self):
+        self.master.rendezvous_server = HorovodRendezvousServer(
+            server_host="localhost"
+        )
+        self.master.rendezvous_server.start()
+        self.master.rendezvous_server.set_worker_hosts(
+            ["172.0.0.1", "172.0.0.2"]
+        )
+
+        mock_instance_manager = Mock()
+        mock_instance_manager.get_worker_pod_ip = MagicMock(
+            return_value="172.0.0.1"
+        )
+        self.master.instance_manager = mock_instance_manager
+        master_servicer = MasterServicer(
+            3, evaluation_service=None, master=self.master
+        )
+        request = elasticdl_pb2.GetCommRankRequest()
+        request.worker_id = 0
+        rank_response = master_servicer.get_comm_rank(request, None)
+        self.assertEqual(rank_response.world_size, 2)
+        self.assertEqual(rank_response.rank_id, 0)
+        self.assertEqual(rank_response.rendezvous_id, 1)
 
 
 if __name__ == "__main__":

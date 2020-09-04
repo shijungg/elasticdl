@@ -1,3 +1,16 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import random
 import time
@@ -71,7 +84,6 @@ class K8sClientTest(unittest.TestCase):
                 volume=None,
                 image_pull_policy="Never",
                 restart_policy="Never",
-                expose_ports=False,
             )
             time.sleep(5)
 
@@ -93,24 +105,6 @@ class K8sClientTest(unittest.TestCase):
                 worker.metadata.labels[k8s.ELASTICDL_REPLICA_INDEX_KEY], str(i)
             )
 
-        # Start 3 worker services
-        for i in range(3):
-            c.create_worker_service(i)
-
-        # Check worker services
-        for i in range(3):
-            service = c.get_worker_service(i)
-            self.assertIsNotNone(service)
-            self.assertEqual(
-                service.spec.selector[k8s.ELASTICDL_JOB_KEY], c.job_name
-            )
-            self.assertEqual(
-                service.spec.selector[k8s.ELASTICDL_REPLICA_TYPE_KEY], "worker"
-            )
-            self.assertEqual(
-                service.spec.selector[k8s.ELASTICDL_REPLICA_INDEX_KEY], str(i)
-            )
-
         # Start 2 ps pods
         for i in range(2):
             _ = c.create_ps(
@@ -123,7 +117,6 @@ class K8sClientTest(unittest.TestCase):
                 volume=None,
                 image_pull_policy="Never",
                 restart_policy="Never",
-                expose_ports=False,
             )
             time.sleep(5)
 
@@ -193,7 +186,6 @@ class K8sClientTest(unittest.TestCase):
             volume=None,
             image_pull_policy="Never",
             restart_policy="Never",
-            expose_ports=False,
         )
 
         label_k = "status"

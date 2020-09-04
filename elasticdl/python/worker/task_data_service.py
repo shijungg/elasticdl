@@ -1,3 +1,16 @@
+# Copyright 2020 The ElasticDL Authors. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import threading
 import time
 from collections import deque
@@ -13,15 +26,16 @@ from elasticdl.python.data.reader.data_reader_factory import create_data_reader
 class TaskDataService(object):
     def __init__(
         self,
-        worker,
+        master_client,
         training_with_evaluation,
+        custom_data_reader=None,
         data_reader_params=None,
         data_origin=None,
     ):
-        self._worker = worker
+        self._mc = master_client
         self._create_data_reader_fn = create_data_reader
-        if self._worker._custom_data_reader is not None:
-            self._create_data_reader_fn = self._worker._custom_data_reader
+        if custom_data_reader is not None:
+            self._create_data_reader_fn = custom_data_reader
         self._training_with_evaluation = training_with_evaluation
         self._lock = threading.Lock()
         self._pending_dataset = True
@@ -60,7 +74,7 @@ class TaskDataService(object):
             }
         else:
             exec_counters = None
-        self._worker.report_task_result(
+        self._mc.report_task_result(
             task.task_id, err_msg, exec_counters=exec_counters
         )
 
@@ -166,7 +180,7 @@ class TaskDataService(object):
             # records so this should not be time consuming.
             if self._warm_up_task is None and not self._has_warmed_up:
                 while True:
-                    task = self._worker.get_task()
+                    task = self._mc.get_task()
                     if task.type != elasticdl_pb2.WAIT:
                         break
                     time.sleep(2)
@@ -200,7 +214,7 @@ class TaskDataService(object):
                 task = self._warm_up_task
                 self._warm_up_task = None
             else:
-                task = self._worker.get_task()
+                task = self._mc.get_task()
             if not task.shard_name:
                 if task.type == elasticdl_pb2.WAIT:
                     self._pending_dataset = True
